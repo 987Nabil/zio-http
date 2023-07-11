@@ -161,7 +161,7 @@ private[cli] object CliEndpoint {
               ),
             )
         }
-      case HttpCodec.Header(name, textCodec, _)     =>
+      case HttpCodec.Header(name, textCodec, _)          =>
         textCodec.asInstanceOf[TextCodec[_]] match {
           case TextCodec.UUIDCodec        =>
             Set(
@@ -227,7 +227,7 @@ private[cli] object CliEndpoint {
               ),
             )
         }
-      case HttpCodec.Method(codec, _)               =>
+      case HttpCodec.Method(codec, _)                =>
         codec.asInstanceOf[SimpleCodec[_, _]] match {
           case SimpleCodec.Specified(method) =>
             Set(
