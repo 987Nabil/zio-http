@@ -31,7 +31,7 @@ import zio.http._
 
 object HelloWorld extends ZIOAppDefault {
 
-  val app: HttpApp[Any] = 
+  val app: HttpApp[Any, Response] = 
     Routes(
       Method.GET / "text" -> handler(Response.text("Hello World!"))
     ).toHttpApp
