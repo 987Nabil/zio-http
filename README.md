@@ -31,10 +31,10 @@ import zio.http._
 
 object HelloWorld extends ZIOAppDefault {
 
-  val app: HttpApp[Any, Response] = 
-    HttpApp(
+  val app: Routes[Any, Response] = 
+    Routes(
       Method.GET / "text" -> handler(Response.text("Hello World!"))
-    ).toHttpApp
+    )
 
   override val run =
     Server.serve(app).provide(Server.default)

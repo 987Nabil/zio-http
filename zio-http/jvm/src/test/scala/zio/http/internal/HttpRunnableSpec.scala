@@ -16,10 +16,9 @@
 
 package zio.http.internal
 
-import zio.{Scope, ZIO}
-
 import zio.http.URL.Location
 import zio.http._
+import zio.{Scope, ZIO}
 
 /**
  * Should be used only when e2e tests needs to be written. Typically we would
@@ -29,9 +28,9 @@ import zio.http._
  * requests.
  */
 abstract class HttpRunnableSpec extends ZIOHttpSpec { self =>
-  implicit class RunnableHttpClientAppSyntax[R](route: HttpApp[R, Response]) {
+  implicit class RunnableHttpClientAppSyntax[R](route: Routes[R, Response]) {
 
-    def app: HttpApp[R, Response] = route
+    def app: Routes[R, Response] = route
 
     /**
      * Deploys the http application on the test server and returns a Http of
@@ -107,12 +106,12 @@ abstract class HttpRunnableSpec extends ZIOHttpSpec { self =>
     for {
       server <- ZIO.service[Server]
       ds     <- ZIO.service[DynamicServer]
-      app = DynamicServer.app(ds)
-      port <- Server.install(app.toHttpApp)
+      handler = DynamicServer.handler(ds)
+      port <- Server.install(handler.toRoutes)
       _    <- DynamicServer.setStart(server)
     } yield port
 
-  def serve[R](app: HttpApp[R, Response]): ZIO[R with DynamicServer with Server, Nothing, Int] =
+  def serve[R](app: Routes[R, Response]): ZIO[R with DynamicServer with Server, Nothing, Int] =
     for {
       server <- ZIO.service[Server]
       port   <- Server.install(app)
