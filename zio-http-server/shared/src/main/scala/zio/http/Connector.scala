@@ -70,9 +70,50 @@ case class Connector(
    * IP falls back to the socket peer address.
    */
   trustedProxy: TrustedProxyConfig = TrustedProxyConfig.default,
+  /**
+   * Network transport family of this binding. `Tcp` serves the H1/H2C/H2
+   * family; `Udp` is registered for the future QUIC seam only and every UDP
+   * binding fails [[validate]] because no QUIC-family protocol is advertised.
+   */
+  transport: TransportKind = TransportKind.Tcp,
+  /**
+   * How one application protocol is selected per connection. `Single` keeps the
+   * prior one-protocol behavior; `TlsAlpn` and `CleartextPreface` describe the
+   * shared-connector policies the listener/engine work executes.
+   */
+  negotiation: NegotiationPolicy = NegotiationPolicy.Single,
 ) {
   if (maxRequestBodySize < 0L)
     throw new IllegalArgumentException("maxRequestBodySize must be non-negative")
+
+  /**
+   * The validated protocol set for this connector, migrated from the legacy
+   * single-`protocol` field. `H3` has no set mapping and reports
+   * [[ConnectorFailure.H3NotAdvertised]].
+   */
+  def protocolSet: Either[ConnectorFailure, ProtocolSet] =
+    ProtocolSet.fromLegacy(protocol)
+
+  /** True when this connector carries TLS identity (`H2` or `H3`). */
+  def tlsPresent: Boolean =
+    protocol match {
+      case Protocol.H2C(_)      => false
+      case Protocol.H2(_, _)    => true
+      case Protocol.H3(_, _, _) => true
+    }
+
+  /**
+   * Typed validation of the transport/protocol-set/TLS/policy combination.
+   * Pure: binds nothing. Runtime dispatch of shared sets belongs to the
+   * listener/engine work that follows this model.
+   */
+  def validate: Either[ConnectorFailure, Unit] =
+    for {
+      set <- protocolSet
+      _   <- ConnectorValidation.validateTransport(transport, set)
+      _   <- ConnectorValidation.validateTls(set, tlsPresent)
+      _   <- ConnectorValidation.validatePolicy(negotiation, set, tlsPresent)
+    } yield ()
 }
 
 object Connector {
