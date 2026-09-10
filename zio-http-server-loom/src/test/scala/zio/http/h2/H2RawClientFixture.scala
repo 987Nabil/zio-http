@@ -91,6 +91,20 @@ object H2RawClientFixture {
     def sendFrame(frame: H2Frame): Unit   = sendRaw(FrameCodec.encode(frame).toArray)
     def sendRaw(bytes: Array[Byte]): Unit = { out.write(bytes); out.flush() }
 
+    /**
+     * HPACK-encodes request headers with this connection's encoder (shares the
+     * dynamic table with every other frame sent on this connection).
+     */
+    def encodeHeaders(fields: List[HeaderField]): Chunk[Byte] =
+      encoder.encode(fields)
+
+    /** HPACK-decodes a response header block with this connection's decoder. */
+    def decodeHeaders(block: Chunk[Byte]): List[HeaderField] =
+      decoder.decode(block) match {
+        case Right(fields) => fields
+        case Left(error)   => throw new AssertionError("HPACK decode: " + error)
+      }
+
     def readFrame(): H2Frame = {
       while (true) {
         FrameCodec.decode(buf) match {
