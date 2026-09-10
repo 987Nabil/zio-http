@@ -15,6 +15,7 @@ import zio.blocks.chunk.Chunk
 import zio.blocks.context.Context
 
 import zio.http.{
+  AcceptedConnection,
   BindAddress,
   Body,
   BoundAddress,
@@ -140,6 +141,15 @@ final class H1Transport[Ctx](
 
   /** Live connections owned by this engine (see [[awaitQuiescent]]). */
   private val inFlight = new InFlightTracker()
+
+  /**
+   * Serve one accepted connection (Todo 11): the shared TLS dispatch engine
+   * terminates TLS upstream and hands the plaintext streams here when ALPN
+   * selected HTTP/1.1. Tracking, framing, limits and drain semantics are the
+   * single `serveConnection` path cleartext `start` uses — no fork.
+   */
+  private[http] def serveAccepted(conn: AcceptedConnection): Unit =
+    serveConnection(conn.input, conn.output)
 
   private def serveConnection(input: InputStream, output: OutputStream): Unit = {
     val tracker: () => Unit = () => {

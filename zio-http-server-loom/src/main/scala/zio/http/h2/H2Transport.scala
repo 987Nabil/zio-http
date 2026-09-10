@@ -15,6 +15,7 @@ import zio.blocks.telemetry.{AttributeValue, ConsoleLogRecordProcessor, LoggerPr
 import zio.http.h2.H2Frame.{Data, Headers, WindowUpdate}
 import zio.http.h2.hpack.{HeaderField, Hpack, HpackCodec}
 import zio.http.{
+  AcceptedConnection,
   BindAddress,
   Body,
   BoundAddress,
@@ -90,62 +91,14 @@ final class H2Transport[Ctx](
       case BindAddress.Tcp(host, port) =>
         // Transport owns H2 framing/routing only: TCP accept, TLS setup,
         // virtual-thread hosting, binding and active resources come from the
-        // protocol-independent listener. ALPN metadata stays surfaced on the
-        // accepted connection for a later dispatch layer; enforcement of the
-        // configured ALPN policy still happens inside the TLS handshake.
+        // protocol-independent listener. Per-connection ALPN dispatch lives in
+        // serveAccepted (Todo 11); enforcement of the configured ALPN policy
+        // still happens inside the TLS handshake.
         val listener = new LoomListener(
           host,
           port,
           tlsConfig,
-          conn => {
-            val input  = conn.input
-            val output = conn.output
-            val peer   = PeerInfo(conn.peer.address, conn.peer.peerCert)
-            activeConnectionCount.incrementAndGet()
-            activeConnections.add(1L, "protocol" -> protocolName)
-            inFlight.enter()
-            try {
-              val flowController =
-                new FlowController(H2Settings.DefaultInitialWindowSize.toInt, http2Config.initialWindowSize)
-              val hpackCodec     = new HpackCodec()
-              // Trust inputs (peer IP literal, mTLS cert presence) are
-              // connection-stable: decide once per connection so the
-              // per-request path never re-parses the peer IP.
-              val peerTrusted    = connector.trustedProxy.isTrusted(peer.address, peer.hasPeerCert)
-              val connection     =
-                new H2Connection(
-                  input = input,
-                  output = output,
-                  maxConcurrentStreams = http2Config.maxConcurrentStreams,
-                  flowController = flowController,
-                  hpackCodec = hpackCodec,
-                  localSettings = Some(localSettings),
-                  maxHeaderListSize = http2Config.maxHeaderListSize,
-                  idleTimeoutMs = H2ConnectionControl.idleTimeoutMs(connector),
-                  requestTimeoutMs = connector.requestTimeoutMs,
-                  headerTimeoutMs = connector.headerTimeoutMs,
-                )
-              connections.add(connection)
-              try
-                connection.run(stream =>
-                  handleStream(stream, flowController, hpackCodec, connection, peer, peerTrusted),
-                )
-              finally connections.remove(connection)
-            } catch {
-              case e: Throwable =>
-                logger.error(
-                  "H2 connection error",
-                  "protocol"      -> AttributeValue.StringValue(protocolName),
-                  "error_type"    -> AttributeValue.StringValue(e.getClass.getSimpleName),
-                  "error_message" -> AttributeValue.StringValue(Option(e.getMessage).getOrElse("")),
-                  "stacktrace"    -> AttributeValue.StringValue(stackTraceToString(e)),
-                )
-            } finally {
-              inFlight.exit()
-              activeConnectionCount.decrementAndGet()
-              activeConnections.add(-1L, "protocol" -> protocolName)
-            }
-          },
+          conn => serveAccepted(conn),
         )
         val bound    = listener.start()
         BoundConnectorHandle(
@@ -157,6 +110,63 @@ final class H2Transport[Ctx](
       case BindAddress.Unix(path)      =>
         throw new UnsupportedOperationException("Unix domain sockets are not implemented yet: " + path)
     }
+
+  /**
+   * Serve one accepted connection (Todo 11): the exact ALPN gate runs before
+   * any byte reaches the H2 frame decoder. Cleartext (H2C) carries no ALPN; TLS
+   * must have negotiated `h2` — anything else (`http/1.1`, unknown, empty under
+   * a permissive policy) returns at once, and the handler return closes the
+   * socket. The shared dispatch engine (`H1H2TlsEngine`) routes `http/1.1` to
+   * the H1 engine instead; this transport never parses it.
+   */
+  private[http] def serveAccepted(conn: AcceptedConnection): Unit = {
+    if (conn.secure && conn.negotiatedAlpn != Some("h2")) return
+    val input  = conn.input
+    val output = conn.output
+    val peer   = PeerInfo(conn.peer.address, conn.peer.peerCert)
+    activeConnectionCount.incrementAndGet()
+    activeConnections.add(1L, "protocol" -> protocolName)
+    inFlight.enter()
+    try {
+      val flowController =
+        new FlowController(H2Settings.DefaultInitialWindowSize.toInt, http2Config.initialWindowSize)
+      val hpackCodec     = new HpackCodec()
+      // Trust inputs (peer IP literal, mTLS cert presence) are
+      // connection-stable: decide once per connection so the
+      // per-request path never re-parses the peer IP.
+      val peerTrusted    = connector.trustedProxy.isTrusted(peer.address, peer.hasPeerCert)
+      val connection     =
+        new H2Connection(
+          input = input,
+          output = output,
+          maxConcurrentStreams = http2Config.maxConcurrentStreams,
+          flowController = flowController,
+          hpackCodec = hpackCodec,
+          localSettings = Some(localSettings),
+          maxHeaderListSize = http2Config.maxHeaderListSize,
+          idleTimeoutMs = H2ConnectionControl.idleTimeoutMs(connector),
+          requestTimeoutMs = connector.requestTimeoutMs,
+          headerTimeoutMs = connector.headerTimeoutMs,
+        )
+      connections.add(connection)
+      try
+        connection.run(stream => handleStream(stream, flowController, hpackCodec, connection, peer, peerTrusted))
+      finally connections.remove(connection)
+    } catch {
+      case e: Throwable =>
+        logger.error(
+          "H2 connection error",
+          "protocol"      -> AttributeValue.StringValue(protocolName),
+          "error_type"    -> AttributeValue.StringValue(e.getClass.getSimpleName),
+          "error_message" -> AttributeValue.StringValue(Option(e.getMessage).getOrElse("")),
+          "stacktrace"    -> AttributeValue.StringValue(stackTraceToString(e)),
+        )
+    } finally {
+      inFlight.exit()
+      activeConnectionCount.decrementAndGet()
+      activeConnections.add(-1L, "protocol" -> protocolName)
+    }
+  }
 
   private def tlsConfig =
     connector.protocol match {
