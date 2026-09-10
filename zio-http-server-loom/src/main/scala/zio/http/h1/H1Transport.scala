@@ -26,13 +26,18 @@ import zio.http.{
   Headers,
   HeadersBuilder,
   LoomListener,
+  LoomServerTelemetry,
   Method,
   Path,
   ProtocolEngine,
   ProtocolId,
+  ProtocolLabel,
   Request,
   Response,
   Routes,
+  ServerDiagnostic,
+  ServerTelemetry,
+  TimeoutKind,
   TransportKind,
   URL,
   Version,
@@ -79,6 +84,7 @@ final class H1Transport[Ctx](
   context: Context[Ctx],
   connector: Connector,
   defectHandler: DefectHandler,
+  telemetry: ServerTelemetry = LoomServerTelemetry.global,
 ) extends ProtocolEngine {
 
   def id: EngineId = EngineId("h1")
@@ -96,6 +102,7 @@ final class H1Transport[Ctx](
   /** Force-close every tracked connection immediately. */
   def close(): Unit = {
     draining.set(true)
+    forceClosed.set(true)
     forceCloseTrackers.asScala.foreach { close =>
       try close()
       catch {
@@ -109,8 +116,15 @@ final class H1Transport[Ctx](
       case BindAddress.Tcp(host, port) =>
         // Cleartext only: TLS/ALPN selection belongs to the dispatch layer of
         // a later todo; this engine never sees a handshake.
-        val listener = new LoomListener(host, port, None, conn => serveConnection(conn.input, conn.output))
-        val bound    = listener.start()
+        val bound =
+          try {
+            val listener = new LoomListener(host, port, None, conn => serveConnection(conn.input, conn.output))
+            listener.start()
+          } catch {
+            case NonFatal(e) =>
+              telemetry.record(ServerDiagnostic.BindFailure(connectorLabel, e.getClass.getSimpleName))
+              throw e
+          }
         BoundConnectorHandle(
           BoundConnector(BoundAddress.Tcp(bound.host, bound.port), connector.protocol),
           bound.close,
@@ -120,9 +134,13 @@ final class H1Transport[Ctx](
         throw new UnsupportedOperationException("Unix domain sockets are not implemented yet: " + path)
     }
 
+  private val connectorLabel: String = ServerTelemetry.connectorLabel(connector)
+
   private val dispatcher: EngineDispatcher[Ctx] = new EngineDispatcher(routes, context, defectHandler)
 
   private val draining: AtomicBoolean = new AtomicBoolean(false)
+
+  private val forceClosed: AtomicBoolean = new AtomicBoolean(false)
 
   private val forceCloseTrackers = ConcurrentHashMap.newKeySet[() => Unit]()
 
@@ -132,6 +150,7 @@ final class H1Transport[Ctx](
       closeQuietly(output)
     }
     forceCloseTrackers.add(tracker)
+    telemetry.record(ServerDiagnostic.ConnectionOpened(ProtocolLabel.H1, connectorLabel))
     try {
       // A connection accepted during drain is new work: close without reading.
       if (!draining.get()) connectionLoop(input, output)
@@ -139,6 +158,13 @@ final class H1Transport[Ctx](
       case NonFatal(_) => ()
     } finally {
       forceCloseTrackers.remove(tracker)
+      telemetry.record(
+        ServerDiagnostic.ConnectionClosed(
+          ProtocolLabel.H1,
+          connectorLabel,
+          drained = draining.get() && !forceClosed.get(),
+        ),
+      )
       closeQuietly(input)
       closeQuietly(output)
     }
@@ -151,8 +177,21 @@ final class H1Transport[Ctx](
       val cancelRequest = newRequestGuard(input, output)
       try {
         readOneRequest(decoder, input) match {
-          case H1Transport.InboundClosed             => alive = false
+          case H1Transport.InboundClosed             =>
+            // The request guard fires by closing the streams: a close with
+            // `expired` set is a request-timeout kill, not a clean EOF or a
+            // dirty disconnect (both leave `expired` unset).
+            if (cancelRequest.expired.get()) recordRequestTimeout()
+            alive = false
           case H1Transport.InboundMalformed(error)   =>
+            telemetry.record(
+              ServerDiagnostic.ParseRejected(
+                ProtocolLabel.H1,
+                connectorLabel,
+                error.getClass.getSimpleName,
+                Some(H1Transport.statusFor(error)),
+              ),
+            )
             writeError(output, H1Transport.statusFor(error), H1Transport.reasonFor(error))
             alive = false
           case H1Transport.InboundRequests(requests) =>
@@ -161,7 +200,10 @@ final class H1Transport[Ctx](
               alive = handleAndRespond(requests(index), output)
               index += 1
             }
-            if (cancelRequest.expired.get()) alive = false
+            if (cancelRequest.expired.get()) {
+              recordRequestTimeout()
+              alive = false
+            }
         }
       } finally cancelRequest.cancel()
     }
@@ -198,6 +240,20 @@ final class H1Transport[Ctx](
     )
   }
 
+  /**
+   * Records a request-timeout kill: the per-turn guard fired and closed the
+   * streams, ending the connection without a response.
+   */
+  private def recordRequestTimeout(): Unit =
+    telemetry.record(
+      ServerDiagnostic.RequestTimeout(
+        ProtocolLabel.H1,
+        connectorLabel,
+        TimeoutKind.Request,
+        "RequestTimeout",
+      ),
+    )
+
   private def readOneRequest(decoder: H1Decoder, input: InputStream): H1Transport.Inbound = {
     val buf                          = new Array[Byte](8192)
     var outcome: H1Transport.Inbound = null
@@ -227,44 +283,83 @@ final class H1Transport[Ctx](
    */
   private def handleAndRespond(h1request: H1Request, output: OutputStream): Boolean =
     try {
-      val methodName = h1request.method
+      val startedAtNanos  = System.nanoTime()
+      def elapsedMs: Long = (System.nanoTime() - startedAtNanos) / 1000000L
+      val methodName      = h1request.method
       if (methodName == "CONNECT") {
+        telemetry.record(
+          ServerDiagnostic.ParseRejected(ProtocolLabel.H1, connectorLabel, "UnsupportedMethod", Some(501)),
+        )
         writeError(output, 501, "Not Implemented")
         false
       } else {
         Method.fromString(methodName) match {
           case None         =>
+            telemetry.record(
+              ServerDiagnostic.ParseRejected(ProtocolLabel.H1, connectorLabel, "UnknownMethod", Some(501)),
+            )
             writeError(output, 501, "Not Implemented")
             false
           case Some(method) =>
             buildUrl(method, h1request.target) match {
               case None      =>
+                telemetry.record(
+                  ServerDiagnostic.ParseRejected(ProtocolLabel.H1, connectorLabel, "InvalidTarget", Some(400)),
+                )
                 writeError(output, 400, "Bad Request")
                 false
               case Some(url) =>
                 if (h1request.body.length.toLong > connector.maxRequestBodySize) {
+                  telemetry.record(
+                    ServerDiagnostic.ParseRejected(ProtocolLabel.H1, connectorLabel, "BodyTooLarge", Some(413)),
+                  )
                   writeError(output, 413, "Payload Too Large")
                   false
                 } else {
-                  val request  = Request(
+                  val request   = Request(
                     method,
                     url,
                     buildHeaders(h1request.headers),
                     Body.fromChunk(h1request.body),
                     Version.`HTTP/1.1`,
                   )
-                  val response =
+                  val response  =
                     try dispatcher.dispatch(request)
                     catch {
-                      case NonFatal(_) => Response.internalServerError
+                      case NonFatal(e) =>
+                        telemetry.record(
+                          ServerDiagnostic.RequestCompleted(
+                            ProtocolLabel.H1,
+                            connectorLabel,
+                            method.toString,
+                            request.url.path.encode,
+                            500,
+                            elapsedMs,
+                          ),
+                        )
+                        Response.internalServerError
                     }
-                  writeResponse(method, h1request, response, output)
+                  val keepAlive = writeResponse(method, h1request, response, output)
+                  telemetry.record(
+                    ServerDiagnostic.RequestCompleted(
+                      ProtocolLabel.H1,
+                      connectorLabel,
+                      method.toString,
+                      request.url.path.encode,
+                      response.status.code,
+                      elapsedMs,
+                    ),
+                  )
+                  keepAlive
                 }
             }
         }
       }
     } catch {
-      case NonFatal(_) =>
+      case NonFatal(e) =>
+        telemetry.record(
+          ServerDiagnostic.ParseRejected(ProtocolLabel.H1, connectorLabel, e.getClass.getSimpleName, Some(500)),
+        )
         writeError(output, 500, "Internal Server Error")
         false
     }

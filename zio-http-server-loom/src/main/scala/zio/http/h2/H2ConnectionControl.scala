@@ -2,6 +2,7 @@ package zio.http.h2
 
 import java.io.OutputStream
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
+import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.{
   CancellationException,
   ConcurrentHashMap,
@@ -26,24 +27,26 @@ final class H2ConnectionControl(
   mux: Mux[Int, H2Frame, H2Frame],
   idleTimeoutMs: Long = 60000,
   requestTimeoutMs: Long = 30000,
-  writeLock: Object = null,
+  writeLock: ReentrantLock = null,
   lastStreamId: () => Int = () => 0,
   drainTimeoutMs: Long = 1000,
   onGracefulShutdown: () => Unit = () => (),
 ) {
   // Single shared writer lock: the live H2Connection passes its own
-  // writeLock here so GOAWAY/RST_STREAM bytes and the connection's response
-  // bytes never interleave on the OutputStream. A null lock (unit tests)
-  // falls back to a private lock.
-  private val effectiveWriteLock: Object =
-    if (writeLock != null) writeLock else new Object
-  private val goingAwayState             = new AtomicBoolean(false)
-  private val closedState                = new AtomicBoolean(false)
-  private val lastActivityNanos          = new AtomicLong(System.nanoTime())
-  private val lastStreamIdState          = new AtomicInteger(Int.MaxValue)
-  private val idleTimerState             = new AtomicBoolean(false)
-  private val idleTimerThread            = new AtomicReference[Thread](null)
-  private val trackedStreams             = new ConcurrentHashMap[Int, java.lang.Boolean]()
+  // ReentrantLock here so GOAWAY/RST_STREAM bytes and the connection's
+  // response bytes never interleave on the OutputStream. A null lock (unit
+  // tests) falls back to a private lock. A ReentrantLock — never a monitor
+  // `synchronized` block — so parked Loom virtual threads unmount instead of
+  // pinning their carrier while contended on the wire.
+  private val effectiveWriteLock: ReentrantLock =
+    if (writeLock != null) writeLock else new ReentrantLock()
+  private val goingAwayState                    = new AtomicBoolean(false)
+  private val closedState                       = new AtomicBoolean(false)
+  private val lastActivityNanos                 = new AtomicLong(System.nanoTime())
+  private val lastStreamIdState                 = new AtomicInteger(Int.MaxValue)
+  private val idleTimerState                    = new AtomicBoolean(false)
+  private val idleTimerThread                   = new AtomicReference[Thread](null)
+  private val trackedStreams                    = new ConcurrentHashMap[Int, java.lang.Boolean]()
 
   def trackStream(streamId: Int): Unit   = trackedStreams.put(streamId, java.lang.Boolean.TRUE)
   def untrackStream(streamId: Int): Unit = trackedStreams.remove(streamId)
@@ -222,10 +225,11 @@ final class H2ConnectionControl(
 
   private def writeFrame(frame: H2Frame, flush: Boolean): Unit              = {
     val bytes = FrameCodec.encode(frame).toArray
-    effectiveWriteLock.synchronized {
+    effectiveWriteLock.lock()
+    try {
       output.write(bytes)
       if (flush) output.flush()
-    }
+    } finally effectiveWriteLock.unlock()
   }
   private def recordLastStreamId(streamId: Int): Unit                       = {
     var done = false
