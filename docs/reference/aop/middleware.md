@@ -152,10 +152,17 @@ import zio._
 import zio.http._
 
 // compose basic auth, request/response logging, timeouts middlewares
-val composedMiddlewares = Middleware.basicAuth("user","pw") ++ 
-        Middleware.debug ++ 
-        Middleware.timeout(5.seconds) 
+val composedMiddlewares =
+  Middleware.basicAuth[String] { basic =>
+    // Constant-time comparison to avoid timing side-channels (RFC 6919).
+    val userOk = java.security.MessageDigest.isEqual(basic.username.getBytes, "admin".getBytes)
+    val passOk = java.security.MessageDigest.isEqual(basic.password.getBytes, "secret".getBytes)
+    if (userOk && passOk) Right(basic.username)
+    else Left(Response.unauthorized)
+  }.andThen(Middleware.debug).andThen(Middleware.timeout(5.seconds))
 ```
+
+`Middleware.customAuth` supports two outcomes via `valueAsOutcome` and `haltAsOutcome`: `S` (any provided value) continues with the injected context, and `Halt` rejects the request.
 
 And then we can attach our composed bundle of middlewares to an Http using `@@`
 
@@ -261,7 +268,7 @@ The `Middleware.metrics` middleware is used to collect metrics about the HTTP re
 
 In the following example, we are going to serve two HTTP apps. One app is a backend that has some routes and the other app is a metrics app that serves the Prometheus metrics. We have attached the `Middleware.metrics` middleware to the backend using the `@@` operator.
 
-In this example we used the Prometheus connector, so we need to add the following dependencies to the `build.sbt` file:
+In this example we used the Prometheus connector, so we need to add the following dependencies to the build:
 
 ```scala
 libraryDependencies ++= Seq(

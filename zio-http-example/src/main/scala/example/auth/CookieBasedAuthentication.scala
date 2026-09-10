@@ -5,6 +5,7 @@ package example.auth
 import zio._
 
 import zio.http._
+import zio.http.netty.server.NettyServer
 
 object CookieBasedAuthentication extends ZIOAppDefault {
   val route: Routes[Ref[Map[String, String]], Nothing] =
@@ -28,7 +29,13 @@ object CookieBasedAuthentication extends ZIOAppDefault {
             sameSite = Some(Cookie.SameSite.Strict),
           ),
         )
-      } @@ Middleware.basicAuth("admin", "admin"),
+      } @@ Middleware.basicAuth[String] {
+        case Header.Authorization.Basic(u, p)
+            if java.security.MessageDigest.isEqual(u.getBytes("UTF-8"), "admin".getBytes("UTF-8")) &&
+              java.security.MessageDigest.isEqual(p.getBytes("UTF-8"), "admin".getBytes("UTF-8")) =>
+          Right("admin")
+        case _ => Left(Response.unauthorized)
+      },
       Method.GET / "logout"         -> handler {
         Response.ok.addCookie(Cookie.clear("session_id"))
       },
@@ -46,7 +53,7 @@ object CookieBasedAuthentication extends ZIOAppDefault {
     Server
       .serve(route)
       .provide(
-        Server.default,
+        NettyServer.default,
         ZLayer.fromZIO(Ref.make(Map.empty[String, String])),
       )
 }

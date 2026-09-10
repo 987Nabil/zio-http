@@ -7,6 +7,7 @@ import zio._
 import zio.http.Middleware.basicAuth
 import zio.http._
 import zio.http.codec.PathCodec.string
+import zio.http.netty.server.NettyServer
 
 object BasicAuth extends ZIOAppDefault {
 
@@ -19,7 +20,13 @@ object BasicAuth extends ZIOAppDefault {
   )
 
   // Add basic auth middleware
-  val routes: Routes[Any, Response] = user @@ basicAuth("admin", "admin")
+  val routes: Routes[Any, Response] = user @@ basicAuth[String] {
+    case Header.Authorization.Basic(u, p)
+        if java.security.MessageDigest.isEqual(u.getBytes("UTF-8"), "admin".getBytes("UTF-8")) &&
+          java.security.MessageDigest.isEqual(p.getBytes("UTF-8"), "admin".getBytes("UTF-8")) =>
+      Right("admin")
+    case _ => Left(Response.unauthorized)
+  }
 
-  val run = Server.serve(routes).provide(Server.default)
+  val run = Server.serve(routes).provide(NettyServer.default)
 }
