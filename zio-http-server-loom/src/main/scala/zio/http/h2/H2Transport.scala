@@ -25,6 +25,7 @@ import zio.http.{
   DefectHandler,
   Halt,
   Header,
+  LoomListener,
   Method,
   Protocol,
   Request,
@@ -67,11 +68,19 @@ final class H2Transport[Ctx](
   def start(): BoundConnectorHandle =
     connector.bind match {
       case BindAddress.Tcp(host, port) =>
-        val listener = new TcpListener(
+        // Transport owns H2 framing/routing only: TCP accept, TLS setup,
+        // virtual-thread hosting, binding and active resources come from the
+        // protocol-independent listener. ALPN metadata stays surfaced on the
+        // accepted connection for a later dispatch layer; enforcement of the
+        // configured ALPN policy still happens inside the TLS handshake.
+        val listener = new LoomListener(
           host,
           port,
           tlsConfig,
-          (input, output, peer) => {
+          conn => {
+            val input  = conn.input
+            val output = conn.output
+            val peer   = PeerInfo(conn.peer.address, conn.peer.peerCert)
             activeConnectionCount.incrementAndGet()
             activeConnections.add(1L, "protocol" -> protocolName)
             try {
