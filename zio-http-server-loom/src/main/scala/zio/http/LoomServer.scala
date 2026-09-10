@@ -50,12 +50,12 @@ class LoomServer(
 
   /**
    * Bind one connector through its engine: a registered [[H1H2TlsEngine]],
-   * [[H2Engine]] or [[H1Transport]] built with this very connector instance is
-   * started as-is (so its drain/close act on the live serving connections);
-   * every other connector gets an internally-created [[H2Engine]] with the
-   * serve-time routes and context. Other engine implementations
-   * validate-then-serve exactly as in Todo 1 (their wire stack arrives in later
-   * todos).
+   * [[H1H2CleartextEngine]], [[H2Engine]] or [[H1Transport]] built with this
+   * very connector instance is started as-is (so its drain/close act on the
+   * live serving connections); every other connector gets an internally-created
+   * [[H2Engine]] with the serve-time routes and context. Other engine
+   * implementations validate-then-serve exactly as in Todo 1 (their wire stack
+   * arrives in later todos).
    *
    * The match is by reference (`eq`), not by value: two connectors can be
    * structurally equal (for example two ephemeral `localhost(0)` bindings)
@@ -68,11 +68,13 @@ class LoomServer(
     context: Context[Ctx],
   ): BoundProtocolEngine =
     engines.collectFirst {
-      case engine: H1H2TlsEngine[_] if engine.connector eq connector =>
+      case engine: H1H2TlsEngine[_] if engine.connector eq connector       =>
         new BoundProtocolEngine(engine, engine.start())
-      case engine: H2Engine[_] if engine.connector eq connector      =>
+      case engine: H1H2CleartextEngine[_] if engine.connector eq connector =>
         new BoundProtocolEngine(engine, engine.start())
-      case engine: H1Transport[_] if engine.connector eq connector   =>
+      case engine: H2Engine[_] if engine.connector eq connector            =>
+        new BoundProtocolEngine(engine, engine.start())
+      case engine: H1Transport[_] if engine.connector eq connector         =>
         new BoundProtocolEngine(engine, engine.start())
     }.getOrElse {
       val internal = new H2Engine(routes, context, connector, defectHandler)
