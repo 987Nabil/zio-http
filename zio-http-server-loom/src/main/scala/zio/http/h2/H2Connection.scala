@@ -6,6 +6,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
 
 import scala.annotation.experimental
 import scala.util.control.NonFatal
@@ -52,7 +53,21 @@ final class H2Connection(
   private val activeStreams                         = new ConcurrentHashMap[Int, MuxStream[Int, H2Frame, H2Frame]]()
   private val activeHandlers                        = ConcurrentHashMap.newKeySet[Thread]()
   private val decodedRequestHeaders                 = new ConcurrentHashMap[Int, List[HeaderField]]()
-  private val writeLock                             = new Object
+  // Single writer lock for this connection's OutputStream (shared with the
+  // control plane so GOAWAY/RST_STREAM bytes never interleave with response
+  // bytes). A ReentrantLock — never a monitor `synchronized` block — so
+  // Loom virtual threads contended on the wire unmount instead of pinning
+  // their carrier.
+  private val writeLock                             = new ReentrantLock()
+  // Signaled state-change primitive replacing every sleep-poll on the
+  // connection hot paths: inbound delivery, outbound enqueue, stream close
+  // and shutdown all signal; frame waiters park in [[receiveOrPark]] and the
+  // writer thread parks in [[awaitWriterSlot]] (both unmount-friendly
+  // Condition waits, never Thread.sleep quanta).
+  private val signalLock                            = new ReentrantLock()
+  private val stateChanged                          = signalLock.newCondition()
+  // Set by the first [[drain]]: exactly one GOAWAY goes out per connection.
+  private val draining                              = new AtomicBoolean(false)
   private var readBuffer: Chunk[Byte]               = Chunk.empty
   private var peerSettings: List[Setting]           = Nil
   private var pendingHeaders: PendingHeaders        = null
@@ -126,13 +141,106 @@ final class H2Connection(
    * (half-close on END_STREAM, `activeStreams` cleanup) is replicated here so
    * the direct-write path keeps stream lifecycle tracking correct.
    */
-  def writeHeadersDirect(stream: MuxStream[Int, H2Frame, H2Frame], buildFrame: => H2Frame.Headers): Unit =
-    writeLock.synchronized {
+  def writeHeadersDirect(stream: MuxStream[Int, H2Frame, H2Frame], buildFrame: => H2Frame.Headers): Unit = {
+    writeLock.lock()
+    try {
       val frame = buildFrame
       output.write(FrameCodec.encode(frame).toArray)
       output.flush()
       markLocalFrameWrite(stream, frame)
+    } finally writeLock.unlock()
+    // A direct HEADERS write can half-close its stream (see
+    // markLocalFrameWrite): wake the writer so it observes the removal
+    // without waiting out its park bound.
+    signalStateChange()
+  }
+
+  /**
+   * RFC 9113 section 6.8 graceful drain, mapped from
+   * [[zio.http.ProtocolEngine.drain]]: emit GOAWAY(NO_ERROR) carrying the real
+   * highest processed stream id, refuse subsequently-opened streams with
+   * REFUSED_STREAM (see `deliverStreamFrame`), and wake every thread blocked in
+   * a frame or flow-control wait so in-flight work observes the drain promptly
+   * instead of sleeping to its deadline. In-flight streams keep running to
+   * completion; use [[closeNow]] to force-release them. Idempotent: the first
+   * drain sends the single GOAWAY, later drains only re-signal.
+   */
+  def drain(): Unit = {
+    if (draining.compareAndSet(false, true)) {
+      try control.sendGoAway(highestStreamId, H2Error.Code.NO_ERROR)
+      catch {
+        case NonFatal(_) => ()
+      }
     }
+    flowController.wakeAll()
+    signalStateChange()
+  }
+
+  /**
+   * Force-close, mapped from [[zio.http.ProtocolEngine.close]]: fail fast every
+   * thread parked in a flow-control wait (via [[FlowController.invalidate]]) or
+   * a frame wait (via the state-change signal below plus `mux.closeAll`), then
+   * tear the connection down. Idempotent like [[drain]]: safe to call after a
+   * drain or twice.
+   */
+  def closeNow(): Unit = {
+    flowController.invalidate()
+    signalStateChange()
+    shutdown(connectionCancelled("closed"))
+  }
+
+  /** Wake every thread parked in [[receiveOrPark]] or [[awaitWriterSlot]]. */
+  def signalStateChange(): Unit = {
+    signalLock.lock()
+    try stateChanged.signalAll()
+    finally signalLock.unlock()
+  }
+
+  /**
+   * Poll `stream` for one inbound frame; when the queue is empty, park on the
+   * state-change signal until a delivery lands or `waitNanos` elapse.
+   *
+   * The poll runs under the signal lock and every delivery signals under the
+   * same lock after enqueueing, so a frame racing the park cannot be missed:
+   * either it is observed by the poll, or its signal lands after the park
+   * starts and wakes it. A bounded wait (never unparked indefinitely) keeps
+   * liveness even against a missed signal: the caller re-polls on wake.
+   * Unmount-friendly: a `Condition` park, never a sleep-poll quantum and never
+   * a monitor wait.
+   *
+   * Returns the raw mux result in the same shapes `H2Transport.toReceivedFrame`
+   * accepts (`Left` on stream failure).
+   */
+  def receiveOrPark(stream: MuxStream[Int, H2Frame, H2Frame], waitNanos: Long): Any = {
+    signalLock.lock()
+    try {
+      val first = stream.receive()
+      if (!isEmptyReceive(first)) first
+      else {
+        if (waitNanos > 0L) {
+          try stateChanged.awaitNanos(waitNanos)
+          catch {
+            case _: InterruptedException => Thread.currentThread().interrupt()
+          }
+        }
+        stream.receive()
+      }
+    } finally signalLock.unlock()
+  }
+
+  /**
+   * Bounded park for the writer loop: wakes promptly on every outbound enqueue
+   * (see `signalStateChange` callers) and re-checks the per-stream queues at
+   * least every millisecond, matching the previous sleep-quantum worst case
+   * without ever polling.
+   */
+  def awaitWriterSlot(): Unit = {
+    signalLock.lock()
+    try stateChanged.awaitNanos(H2Connection.WriterParkNanos)
+    catch {
+      case _: InterruptedException => Thread.currentThread().interrupt()
+    } finally signalLock.unlock()
+  }
 
   def run(onStream: MuxStream[Int, H2Frame, H2Frame] => Unit): Unit = {
     val writer = Thread.ofVirtual().name("zio-http-h2-writer").start(runnable(writerLoop()))
@@ -229,6 +337,10 @@ final class H2Connection(
       case GoAway(lastStreamId, _, _) =>
         lastGoAwayStreamId = lastStreamId
         closed.set(true)
+        // Streams racing this GOAWAY may wait for frames that will never
+        // arrive: wake them now so they observe the mux teardown instead of
+        // parking to a deadline (shutdown below re-signals regardless).
+        signalStateChange()
       case wu: WindowUpdate           =>
         applyIncomingWindowUpdate(wu)
       case _                          =>
@@ -256,8 +368,9 @@ final class H2Connection(
     deliverStreamFrame(headers, onStream)
   }
 
-  private def deliverStreamFrame(frame: H2Frame, onStream: MuxStream[Int, H2Frame, H2Frame] => Unit): Unit =
+  private def deliverStreamFrame(frame: H2Frame, onStream: MuxStream[Int, H2Frame, H2Frame] => Unit): Unit = {
     frame match {
+      // RFC 9113 section 5.1 explicitly permits WINDOW_UPDATE/PRIORITY/RST_STREAM on a stream
       // RFC 9113 section 5.1 explicitly permits WINDOW_UPDATE/PRIORITY/RST_STREAM on a stream
       // that is already half-closed(remote) or fully closed - including after the stream has
       // been fully removed from the mux (both directions closed, which a fast handler can reach
@@ -309,6 +422,12 @@ final class H2Connection(
             offerInbound(stream, frame)
         }
     }
+    // Every delivery above enqueued an inbound frame, opened a stream, or
+    // closed one: wake parked frame waiters under the signal lock (see
+    // receiveOrPark) so none sleeps through its frame. The early `return`
+    // above (refused opens) goes through sendReset, which signals itself.
+    signalStateChange()
+  }
 
   /**
    * True if `streamId` was opened at some point in this connection's lifetime
@@ -347,6 +466,9 @@ final class H2Connection(
     }
     activeStreams.remove(streamId)
     decodedRequestHeaders.remove(streamId)
+    // The reset cancels the mux entry: wake the writer (it reaps the entry)
+    // and any frame waiter parked on the dead stream.
+    signalStateChange()
   }
 
   /**
@@ -584,7 +706,7 @@ final class H2Connection(
         }
 
         if (wrote) flushOutput()
-        else parkWriter()
+        else awaitWriterSlot()
       }
     } catch {
       case _: IOException => shutdown(connectionCancelled("writer I/O failure"))
@@ -638,14 +760,18 @@ final class H2Connection(
 
   private def writeFrame(frame: H2Frame, flush: Boolean): Unit = {
     val bytes = FrameCodec.encode(frame).toArray
-    writeLock.synchronized {
+    writeLock.lock()
+    try {
       output.write(bytes)
       if (flush) output.flush()
-    }
+    } finally writeLock.unlock()
   }
 
-  private def flushOutput(): Unit =
-    writeLock.synchronized(output.flush())
+  private def flushOutput(): Unit = {
+    writeLock.lock()
+    try output.flush()
+    finally writeLock.unlock()
+  }
 
   private def offerInbound(stream: MuxStream[Int, H2Frame, H2Frame], frame: H2Frame): Unit =
     toUnit(stream.offerInbound(frame)).foreach(error =>
@@ -657,6 +783,11 @@ final class H2Connection(
 
   private def shutdown(reason: MuxError): Unit = {
     control.stopIdleTimer()
+    // The connection is dead: fail fast every thread parked in a
+    // flow-control wait instead of letting it sleep to its deadline, and
+    // wake every parked frame waiter so it observes the mux teardown below.
+    flowController.invalidate()
+    signalStateChange()
     if (closed.compareAndSet(false, true)) {
       mux.closeAll(reason)
       closeQuietly(input)
@@ -667,17 +798,38 @@ final class H2Connection(
       closeQuietly(output)
     }
   }
-
-  private def parkWriter(): Unit =
-    try Thread.sleep(1L)
-    catch {
-      case _: InterruptedException => Thread.currentThread().interrupt()
-    }
 }
 
 @experimental
 private object H2Connection {
   private val ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(StandardCharsets.US_ASCII)
+
+  /**
+   * Upper bound for one writer-loop park: the writer re-checks the per-stream
+   * outbound queues at least this often even without a signal. Matches the
+   * previous sleep-quantum worst case; signals (see `signalStateChange`) make
+   * the common case prompt.
+   */
+  private val WriterParkNanos: Long = 1000000L
+
+  /**
+   * Upper bound for one frame-wait park without a request/body deadline: every
+   * delivery signals, so this only bounds a missed-signal race.
+   */
+  private[h2] val FrameParkNanos: Long = 1000000000L
+
+  /**
+   * True for the empty mux receive shapes (`Right(None)` on 3.x, bare `None` on
+   * 2.13 — mirroring `H2Transport.toReceivedFrame`, which maps both to "no
+   * frame available"): the caller should park. Every other shape (a frame, or a
+   * `Left`/error result) is returned immediately.
+   */
+  private[h2] def isEmptyReceive(result: Any): Boolean =
+    result match {
+      case Right(None) => true
+      case None        => true
+      case _           => false
+    }
 
   /**
    * Mux `open` result across toolchains: the Scala 3 Mux returns a
