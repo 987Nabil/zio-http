@@ -23,7 +23,9 @@ class LoomServer(
    * Explicitly register a thick protocol engine served alongside the
    * connectors. Engines are validated in [[serve]] before any socket is bound:
    * duplicate ids, duplicate protocols and incompatible transports fail with a
-   * deterministic [[EngineRegistrationError]].
+   * deterministic [[EngineRegistrationError]]. TCP and UDP engines may coexist;
+   * no H3 engine is installed, so an H3 connector always fails connector
+   * validation instead.
    */
   def withEngine(engine: ProtocolEngine): LoomServer =
     new LoomServer(connector, additionalConnectors, defectHandler, engine :: engines)
@@ -38,6 +40,12 @@ class LoomServer(
         case Right(_)    => ()
       }
     val allConnectors = connector :: additionalConnectors
+    allConnectors.foreach { c =>
+      c.validate match {
+        case Left(failure) => throw InvalidConnector(failure)
+        case Right(_)      => ()
+      }
+    }
     val bound         = allConnectors.map { c =>
       new H2Transport(routes, context, c, defectHandler).start()
     }
