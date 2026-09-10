@@ -74,19 +74,26 @@ object AppProtocol {
 }
 
 /**
- * Network transport family of a [[Connector]] binding.
+ * Network transport family of a [[Connector]] binding and of a
+ * [[ProtocolEngine]].
  *
- * `Udp` is registered for the future QUIC/H3 seam only: no engine is installed,
- * so [[ConnectorValidation.validateTransport]] rejects every UDP binding with
- * [[ConnectorFailure.TcpUdpMismatch]]. Production configuration must not
- * advertise or run H3.
+ * This is the single transport-kind contract shared by the connector model and
+ * the engine model: `Tcp` serves the H1/H2C/H2 family, `Udp` is registered for
+ * the future QUIC/H3 seam only (no engine is installed, so
+ * [[ConnectorValidation.validateTransport]] rejects every UDP binding with
+ * [[ConnectorFailure.TcpUdpMismatch]]), and `Unix` names Unix-domain-socket
+ * engines. TCP and UDP draw numeric ports from independent OS namespaces, so a
+ * TCP connector/engine and a UDP connector/engine may share a numeric port (see
+ * [[TransportKind.sharesPortNamespace]] and [[Connector.bindConflicts]]).
+ * Production configuration must not advertise or run H3.
  */
 sealed trait TransportKind
 
 object TransportKind {
 
-  case object Tcp extends TransportKind
-  case object Udp extends TransportKind
+  case object Tcp  extends TransportKind
+  case object Udp  extends TransportKind
+  case object Unix extends TransportKind
 
   /**
    * Parses a transport kind by case-object name. Unknown names are rejected
@@ -94,16 +101,32 @@ object TransportKind {
    */
   def fromString(name: String): TransportKind =
     name match {
-      case "Tcp" => Tcp
-      case "Udp" => Udp
-      case other =>
+      case "Tcp"  => Tcp
+      case "Udp"  => Udp
+      case "Unix" => Unix
+      case other  =>
         throw new IllegalArgumentException(
-          s"Unknown TransportKind: '$other'. Expected one of: Tcp, Udp",
+          s"Unknown TransportKind: '$other'. Expected one of: Tcp, Udp, Unix",
         )
+    }
+
+  /**
+   * True when `first` and `second` draw numeric ports from the same OS
+   * namespace: only same-family socket transports share one. In particular a
+   * TCP binding and a UDP binding never conflict, so a future UDP engine can
+   * coexist with TCP engines on one numeric port. Unix-domain sockets bind
+   * paths, not ports, and share no port namespace with anything.
+   */
+  def sharesPortNamespace(first: TransportKind, second: TransportKind): Boolean =
+    (first, second) match {
+      case (Tcp, Tcp) => true
+      case (Udp, Udp) => true
+      case _          => false
     }
 
   implicit val tcpSchema: Schema[Tcp.type]   = Schema.derived[Tcp.type]
   implicit val udpSchema: Schema[Udp.type]   = Schema.derived[Udp.type]
+  implicit val unixSchema: Schema[Unix.type] = Schema.derived[Unix.type]
   implicit val schema: Schema[TransportKind] = Schema.derived[TransportKind]
 }
 
@@ -307,6 +330,16 @@ object ConnectorFailure {
 }
 
 /**
+ * Deterministic serve-time refusal of an invalid [[Connector]].
+ *
+ * Thrown by serve before any socket is bound when [[Connector.validate]]
+ * reports a [[ConnectorFailure]] (unadvertised H3, UDP transport without a
+ * QUIC-family protocol, TLS/policy mismatches). Carries the typed failure so
+ * callers can distinguish the cause without parsing exception messages.
+ */
+final case class InvalidConnector(failure: ConnectorFailure) extends Exception("Invalid connector: " + failure.message)
+
+/**
  * Pure validation of protocol sets against endpoint properties.
  *
  * Every rule reports a [[ConnectorFailure]]; nothing here binds sockets,
@@ -319,16 +352,23 @@ object ConnectorValidation {
    * Transport/protocol family check. TCP serves the H1/H2C/H2 family; UDP is
    * registered for the future QUIC seam only and every UDP binding fails with
    * [[ConnectorFailure.TcpUdpMismatch]] because no QUIC-family protocol is
-   * advertised.
+   * advertised. Unix-domain-socket transports carry no TCP/UDP protocol family
+   * and fail the same way.
    */
   def validateTransport(transport: TransportKind, set: ProtocolSet): Either[ConnectorFailure, Unit] =
     transport match {
-      case TransportKind.Tcp => Right(())
-      case TransportKind.Udp =>
+      case TransportKind.Tcp  => Right(())
+      case TransportKind.Udp  =>
         Left(
           ConnectorFailure.TcpUdpMismatch(
             "UDP transport requires a QUIC-family protocol, but the set holds " + set +
               "; H3/QUIC is not advertised in this build",
+          ),
+        )
+      case TransportKind.Unix =>
+        Left(
+          ConnectorFailure.TcpUdpMismatch(
+            "Unix transport carries no TCP/UDP protocol family, but the set holds " + set,
           ),
         )
     }

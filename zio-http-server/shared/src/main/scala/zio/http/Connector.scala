@@ -119,6 +119,28 @@ case class Connector(
 object Connector {
   val default: Connector = Connector()
 
+  /**
+   * Static bind-conflict check for two connectors: true when both request the
+   * same OS binding, so serving both would collide.
+   *
+   * Two TCP bindings conflict only on the same host and numeric port; two UDP
+   * bindings likewise; TCP and UDP never conflict because their numeric-port
+   * namespaces are independent (see [[TransportKind.sharesPortNamespace]]) — a
+   * future UDP engine may share a numeric port with a TCP connector. Two Unix
+   * bindings conflict on the same path. Ephemeral ports (`0`) never conflict:
+   * the OS assigns distinct ports at bind time.
+   */
+  def bindConflicts(first: Connector, second: Connector): Boolean =
+    (first.bind, second.bind) match {
+      case (BindAddress.Tcp(firstHost, firstPort), BindAddress.Tcp(secondHost, secondPort)) =>
+        firstPort != 0 && secondPort != 0 &&
+        (firstHost == secondHost) && (firstPort == secondPort) &&
+        TransportKind.sharesPortNamespace(first.transport, second.transport)
+      case (BindAddress.Unix(firstPath), BindAddress.Unix(secondPath))                      =>
+        firstPath == secondPath
+      case _                                                                                => false
+    }
+
   /** Default request-body cap: 1 MiB per stream. */
   val DefaultMaxRequestBodySize: Long = 1024L * 1024L
 
