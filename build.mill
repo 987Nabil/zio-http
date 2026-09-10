@@ -387,7 +387,8 @@ object serverLoom extends Module {
   object jvm extends Cross[JvmModule](scalaVersions)
   trait JvmModule extends ZioHttpJvmModule {
     def artifactName     = "zio-http-server-loom"
-    def moduleDeps       = Seq(server.jvm(), h2Codec.jvm())
+    // Todo 7: the Loom H1 engine reuses the strict h1-codec leaf module (no fork).
+    def moduleDeps       = Seq(server.jvm(), h2Codec.jvm(), h1Codec.jvm())
     override def sources = Task.Sources(r / "src" / "main" / "scala")
     // Branch minimum is 75%: ~25% of branches are in private defensive Any-match arms
     // (toStream, toUnit, toOptionalFrame, toReceivedFrame, toSendError) that exist for
