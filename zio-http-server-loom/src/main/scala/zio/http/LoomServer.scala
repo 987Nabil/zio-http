@@ -3,7 +3,7 @@ package zio.http
 import scala.annotation.experimental
 
 import zio.blocks.context.Context
-import zio.http.h2.H2Transport
+import zio.http.h2.H2Engine
 
 @experimental
 class LoomServer(
@@ -38,8 +38,27 @@ class LoomServer(
         case Right(_)    => ()
       }
     val allConnectors = connector :: additionalConnectors
+    // H2 is served behind its ProtocolEngine in every case: a registered
+    // H2Engine whose connector matches is started as-is (so its drain/close
+    // act on the live serving connections); every other connector gets an
+    // internally-created H2Engine with the serve-time routes and context.
+    // Other engine implementations validate-then-serve exactly as in Todo 1
+    // (their wire stack arrives in later todos).
     val bound         = allConnectors.map { c =>
-      new H2Transport(routes, context, c, defectHandler).start()
+      engines.collectFirst { case engine: H2Engine[_] if engine.connector == c => engine } match {
+        case Some(registered) =>
+          val started = registered.start()
+          BoundConnectorHandle(
+            started.binding,
+            () => {
+              started.close0()
+              registered.close()
+            },
+            started.isRunning0,
+          )
+        case None             =>
+          new H2Engine(routes, context, c, defectHandler).start()
+      }
     }
     ServerHandle.live(bound)
   }
