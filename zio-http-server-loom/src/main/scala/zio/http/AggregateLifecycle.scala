@@ -53,7 +53,8 @@ trait LifecycleEngine {
 }
 
 /**
- * Protocol-independent aggregate server handle (lifecycle scaffolding).
+ * Protocol-independent aggregate server handle (Todo 5 contract, Todo 8 engine
+ * wiring).
  *
  * Semantics locked by `AggregateLifecycleSpec`:
  *   - `shutdown` runs exactly once (repeated/concurrent calls are safe):
@@ -67,15 +68,19 @@ trait LifecycleEngine {
  *   - Shutdown issued from an owned thread skips that thread's join
  *     (`skippedSelfJoins`) instead of deadlocking on a self-join.
  *
- * Deliberately NOT a [[ServerHandle]] (which is sealed to its own file): Todo 8
- * unifies the two once real engines are wired.
+ * Todo 8 unifies this with [[ServerHandle]]: `LoomServer.serve` returns this
+ * handle directly, so one `shutdown` drains every engine and `awaitShutdown`
+ * blocks until all of them terminated. Use [[AggregateServerHandle.live]] to
+ * wrap already-bound engines or [[AggregateServerHandle.bindEngines]] for
+ * transactional startup with reverse-order rollback.
  */
 final class AggregateServerHandle private (
   engines: List[LifecycleEngine],
   ownedThreads: List[Thread],
   drainTimeout: Duration,
   ownedJoinTimeout: Duration,
-) {
+  bindings0: List[BoundConnector] = Nil,
+) extends ServerHandle {
   import AggregateLifecycleState._
 
   private val stateRef         = new AtomicReference[AggregateLifecycleState](Running)
@@ -84,11 +89,14 @@ final class AggregateServerHandle private (
   private val errors           = new ConcurrentLinkedQueue[Throwable]()
   private val selfJoinsSkipped = new AtomicInteger(0)
 
+  /** Bindings reported to `ServerHandle` callers (port discovery). */
+  override def bindings: List[BoundConnector] = bindings0
+
   /** Current lifecycle state. */
   def state: AggregateLifecycleState = stateRef.get()
 
   /** True until the handle reaches `Terminated`. */
-  def isRunning: Boolean = state != Terminated
+  override def isRunning: Boolean = state != Terminated
 
   /** Number of owned-thread self-joins skipped by `shutdown`. */
   def skippedSelfJoins: Int = selfJoinsSkipped.get()
@@ -97,7 +105,7 @@ final class AggregateServerHandle private (
   def drainErrors: List[Throwable] = errors.asScala.toList
 
   /** Begin the terminal transition. Idempotent and thread-safe. */
-  def shutdown(): Unit =
+  override def shutdown(): Unit =
     if (shutdownStarted.compareAndSet(false, true)) {
       try {
         stateRef.set(StopAccepting)
@@ -121,23 +129,14 @@ final class AggregateServerHandle private (
    * Block until the handle reaches `Terminated`. Returns at once when the
    * handle is already terminated.
    */
-  def awaitShutdown(): Unit = {
+  override def awaitShutdown(): Unit = {
     terminal.await()
     ()
   }
 
   /** Block up to `timeout` for the terminal state. */
-  def awaitShutdown(timeout: Duration): Boolean =
+  override def awaitShutdown(timeout: Duration): Boolean =
     terminal.await(timeout.toMillis, TimeUnit.MILLISECONDS)
-
-  /** `shutdown` followed by a blocking `awaitShutdown`. */
-  def shutdownAndWait(): Unit = {
-    shutdown()
-    awaitShutdown()
-  }
-
-  /** Alias for `shutdownAndWait`. */
-  def close(): Unit = shutdownAndWait()
 
   private def stopQuietly(engine: LifecycleEngine): Unit =
     try engine.requestStop()
@@ -199,8 +198,9 @@ object AggregateServerHandle {
     ownedThreads: List[Thread] = Nil,
     drainTimeout: Duration = DefaultDrainTimeout,
     ownedJoinTimeout: Duration = DefaultOwnedJoinTimeout,
+    bindings0: List[BoundConnector] = Nil,
   ): AggregateServerHandle =
-    new AggregateServerHandle(engines, ownedThreads, drainTimeout, ownedJoinTimeout)
+    new AggregateServerHandle(engines, ownedThreads, drainTimeout, ownedJoinTimeout, bindings0)
 
   /**
    * Bind engines in order; when a binder fails, force-close the engines bound
@@ -216,13 +216,41 @@ object AggregateServerHandle {
     val bound = List.newBuilder[LifecycleEngine]
     try binders.foreach(binder => bound += binder())
     catch {
-      case bindFailure: Throwable =>
-        bound.result().reverse.foreach { engine =>
-          try engine.forceClose()
-          catch { case rollbackFailure: Throwable => bindFailure.addSuppressed(rollbackFailure) }
-        }
-        throw bindFailure
+      case bindFailure: Throwable => rollbackBound(bound.result(), bindFailure)
     }
     live(bound.result(), ownedThreads, drainTimeout, ownedJoinTimeout)
+  }
+
+  /**
+   * Transactionally bind protocol engines with their listener bindings (Todo
+   * 8): the same reverse-order rollback as [[start]], plus the bound addresses
+   * reported on the returned handle for port discovery.
+   */
+  def bindEngines(
+    binders: List[() => BoundProtocolEngine],
+    ownedThreads: List[Thread] = Nil,
+    drainTimeout: Duration = DefaultDrainTimeout,
+    ownedJoinTimeout: Duration = DefaultOwnedJoinTimeout,
+  ): AggregateServerHandle = {
+    val bound    = List.newBuilder[BoundProtocolEngine]
+    try binders.foreach(binder => bound += binder())
+    catch {
+      case bindFailure: Throwable => rollbackBound(bound.result(), bindFailure)
+    }
+    val adapters = bound.result()
+    live(adapters, ownedThreads, drainTimeout, ownedJoinTimeout, adapters.map(_.binding))
+  }
+
+  /**
+   * Reverse-order rollback shared by [[start]] and [[bindEngines]]: force-close
+   * the engines bound so far (latest first), attach rollback failures as
+   * suppressed to the bind failure, and rethrow it.
+   */
+  private def rollbackBound(bound: List[LifecycleEngine], bindFailure: Throwable): Nothing = {
+    bound.reverse.foreach { engine =>
+      try engine.forceClose()
+      catch { case rollbackFailure: Throwable => bindFailure.addSuppressed(rollbackFailure) }
+    }
+    throw bindFailure
   }
 }

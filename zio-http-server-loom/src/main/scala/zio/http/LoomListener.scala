@@ -124,18 +124,29 @@ private[http] class LoomListener(
 
     val localAddress = serverChannel.getLocalAddress.asInstanceOf[InetSocketAddress]
 
+    // Stop-accept (Todo 8): close the server channel and join the acceptor so
+    // no new TCP connection is accepted, while established connections stay
+    // alive for the engine drain phase. Connection release stays single-shot:
+    // a repeated close never re-closes resources the first close released.
+    val stopAccept: () => Unit = () => {
+      if (running.compareAndSet(true, false)) {
+        closeQuietly(serverChannel)
+        acceptor.interrupt()
+        acceptor.join()
+      }
+    }
+    val releasedConnections    = new AtomicBoolean(false)
+    val closeAll0: () => Unit  = () => {
+      stopAccept()
+      if (releasedConnections.compareAndSet(false, true)) closeAll(activeConnections)
+    }
+
     LoomBoundListener(
       localAddress.getHostString,
       localAddress.getPort,
-      () => {
-        if (running.compareAndSet(true, false)) {
-          closeQuietly(serverChannel)
-          closeAll(activeConnections)
-          acceptor.interrupt()
-          acceptor.join()
-        }
-      },
+      closeAll0,
       () => running.get() && acceptor.isAlive && serverChannel.isOpen,
+      stopAccept,
     )
   }
 
@@ -245,6 +256,12 @@ case class LoomBoundListener(
   port: Int,
   close: () => Unit,
   isRunning: () => Boolean,
+  /**
+   * Stop accepting new connections while established ones stay alive (Todo 8:
+   * the aggregate drain phase calls this before draining the engines; `close`
+   * still force-closes everything).
+   */
+  stopAccepting: () => Unit,
 )
 
 private[http] object LoomListener {

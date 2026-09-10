@@ -1,5 +1,7 @@
 package zio.http.h2
 
+import java.time.Duration
+
 import scala.annotation.experimental
 
 import zio.blocks.context.Context
@@ -12,6 +14,7 @@ import zio.http.{
   Protocol,
   ProtocolEngine,
   ProtocolId,
+  QuiescentEngine,
   Routes,
   TransportKind,
 }
@@ -36,6 +39,8 @@ import zio.http.{
  *     In-flight streams run to completion.
  *   - [[close]]: force-close — parked flow and frame waiters fail fast instead
  *     of parking to their deadlines.
+ *   - [[awaitQuiescent]] (Todo 8): block until the owned connections settle so
+ *     the aggregate handle can bound the drain by a single deadline.
  */
 @experimental
 final class H2Engine[Ctx](
@@ -45,7 +50,8 @@ final class H2Engine[Ctx](
   defectHandler: DefectHandler,
   val id: EngineId = EngineId("h2"),
   sendWindowTimeoutMs: Long = FlowController.DefaultSendWindowTimeoutMs,
-) extends ProtocolEngine {
+) extends ProtocolEngine
+    with QuiescentEngine {
 
   private val transport = new H2Transport(routes, context, connector, defectHandler, sendWindowTimeoutMs)
 
@@ -64,6 +70,8 @@ final class H2Engine[Ctx](
   def drain(): Unit = transport.drainAll()
 
   def close(): Unit = transport.closeAll()
+
+  def awaitQuiescent(timeout: Duration): Boolean = transport.awaitQuiescent(timeout)
 }
 
 @experimental

@@ -49,7 +49,7 @@ private[http] class TcpListener(
 
   def start(): BoundListener = {
     val bound = delegate.start()
-    BoundListener(bound.host, bound.port, bound.close, bound.isRunning)
+    BoundListener(bound.host, bound.port, bound.close, bound.isRunning, bound.stopAccepting)
   }
 }
 
@@ -58,6 +58,7 @@ case class BoundListener(
   port: Int,
   close: () => Unit,
   isRunning: () => Boolean,
+  stopAccepting: () => Unit,
 )
 
 private[http] object TcpListener {
@@ -66,5 +67,5 @@ private[http] object TcpListener {
     LoomListener.createSslContext(tls)
 
   def toGeneric(bound: BoundListener): LoomBoundListener =
-    LoomBoundListener(bound.host, bound.port, bound.close, bound.isRunning)
+    LoomBoundListener(bound.host, bound.port, bound.close, bound.isRunning, bound.stopAccepting)
 }

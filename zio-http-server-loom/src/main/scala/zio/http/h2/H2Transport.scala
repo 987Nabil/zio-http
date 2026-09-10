@@ -1,5 +1,6 @@
 package zio.http.h2
 
+import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
@@ -23,9 +24,11 @@ import zio.http.{
   DefectHandler,
   EngineDispatcher,
   Header,
+  InFlightTracker,
   LoomListener,
   Method,
   Protocol,
+  QuiescentEngine,
   Request,
   Response,
   Routes,
@@ -42,7 +45,7 @@ final class H2Transport[Ctx](
   connector: Connector,
   defectHandler: DefectHandler,
   sendWindowTimeoutMs: Long = FlowController.DefaultSendWindowTimeoutMs,
-) {
+) extends QuiescentEngine {
   // One shared application dispatcher for every stream on every connection
   // (see EngineDispatcher): routing lives outside the wire stack, so the H1
   // engine (Todo 7) and this transport define application behavior exactly
@@ -53,6 +56,18 @@ final class H2Transport[Ctx](
   // (see drainAll/closeAll) iterate this set. Entries are added on accept
   // and removed when the connection handler returns.
   private val connections = ConcurrentHashMap.newKeySet[H2Connection]()
+
+  /**
+   * Live-connection accounting for the aggregate drain (Todo 8): entered on
+   * accept, exited when the connection handler returns, so an empty tracker
+   * means no connection — drained or not — is still running.
+   */
+  private val inFlight = new InFlightTracker()
+
+  /**
+   * Block up to `timeout` for in-flight connections to settle (Todo 8).
+   */
+  def awaitQuiescent(timeout: Duration): Boolean = inFlight.awaitEmpty(timeout)
 
   private val requestCounter        = metric.counter("http.requests.total")
   private val activeConnections     = metric.upDownCounter("http.connections.active")
@@ -88,6 +103,7 @@ final class H2Transport[Ctx](
             val peer   = PeerInfo(conn.peer.address, conn.peer.peerCert)
             activeConnectionCount.incrementAndGet()
             activeConnections.add(1L, "protocol" -> protocolName)
+            inFlight.enter()
             try {
               val flowController =
                 new FlowController(H2Settings.DefaultInitialWindowSize.toInt, http2Config.initialWindowSize)
@@ -125,6 +141,7 @@ final class H2Transport[Ctx](
                   "stacktrace"    -> AttributeValue.StringValue(stackTraceToString(e)),
                 )
             } finally {
+              inFlight.exit()
               activeConnectionCount.decrementAndGet()
               activeConnections.add(-1L, "protocol" -> protocolName)
             }
@@ -135,6 +152,7 @@ final class H2Transport[Ctx](
           BoundConnector(BoundAddress.Tcp(bound.host, bound.port), connector.protocol),
           bound.close,
           bound.isRunning,
+          bound.stopAccepting,
         )
       case BindAddress.Unix(path)      =>
         throw new UnsupportedOperationException("Unix domain sockets are not implemented yet: " + path)
