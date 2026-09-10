@@ -3,6 +3,7 @@ package zio.http.h1
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
+import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -25,11 +26,13 @@ import zio.http.{
   EngineId,
   Headers,
   HeadersBuilder,
+  InFlightTracker,
   LoomListener,
   Method,
   Path,
   ProtocolEngine,
   ProtocolId,
+  QuiescentEngine,
   Request,
   Response,
   Routes,
@@ -77,15 +80,23 @@ import zio.http.{
 final class H1Transport[Ctx](
   routes: Routes[Ctx],
   context: Context[Ctx],
-  connector: Connector,
+  val connector: Connector,
   defectHandler: DefectHandler,
-) extends ProtocolEngine {
+) extends ProtocolEngine
+    with QuiescentEngine {
 
   def id: EngineId = EngineId("h1")
 
   def transportKind: TransportKind = TransportKind.Tcp
 
   def supportedProtocols: Set[ProtocolId] = Set(ProtocolId.Http1)
+
+  /**
+   * Block up to `timeout` for in-flight connections to settle (Todo 8): every
+   * accepted connection enters [[inFlight]] on accept and exits when its
+   * handler returns, so an empty tracker means no live connection remains.
+   */
+  def awaitQuiescent(timeout: Duration): Boolean = inFlight.awaitEmpty(timeout)
 
   /**
    * Graceful drain: in-flight requests finish, served with `Connection: close`;
@@ -115,6 +126,7 @@ final class H1Transport[Ctx](
           BoundConnector(BoundAddress.Tcp(bound.host, bound.port), connector.protocol),
           bound.close,
           bound.isRunning,
+          bound.stopAccepting,
         )
       case BindAddress.Unix(path)      =>
         throw new UnsupportedOperationException("Unix domain sockets are not implemented yet: " + path)
@@ -126,18 +138,23 @@ final class H1Transport[Ctx](
 
   private val forceCloseTrackers = ConcurrentHashMap.newKeySet[() => Unit]()
 
+  /** Live connections owned by this engine (see [[awaitQuiescent]]). */
+  private val inFlight = new InFlightTracker()
+
   private def serveConnection(input: InputStream, output: OutputStream): Unit = {
     val tracker: () => Unit = () => {
       closeQuietly(input)
       closeQuietly(output)
     }
     forceCloseTrackers.add(tracker)
+    inFlight.enter()
     try {
       // A connection accepted during drain is new work: close without reading.
       if (!draining.get()) connectionLoop(input, output)
     } catch {
       case NonFatal(_) => ()
     } finally {
+      inFlight.exit()
       forceCloseTrackers.remove(tracker)
       closeQuietly(input)
       closeQuietly(output)

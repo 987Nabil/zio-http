@@ -1,16 +1,15 @@
 package zio.http.h2
 
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.annotation.experimental
-import scala.collection.immutable.ListMap
 import scala.util.control.NonFatal
 
 import zio.blocks.chunk.Chunk
 import zio.blocks.context.Context
-import zio.blocks.endpoint.{RouteTree, SegmentSubtree}
 import zio.blocks.mux.{MuxError, MuxStream}
-import zio.blocks.scope.Scope
 import zio.blocks.telemetry.{AttributeValue, ConsoleLogRecordProcessor, LoggerProvider, SpanKind, metric, trace}
 
 import zio.http.h2.H2Frame.{Data, Headers, WindowUpdate}
@@ -23,14 +22,15 @@ import zio.http.{
   BoundConnectorHandle,
   Connector,
   DefectHandler,
-  Halt,
+  EngineDispatcher,
   Header,
+  InFlightTracker,
   LoomListener,
   Method,
   Protocol,
+  QuiescentEngine,
   Request,
   Response,
-  Route,
   Routes,
   Scheme,
   TrustedProxyConfig,
@@ -45,9 +45,29 @@ final class H2Transport[Ctx](
   connector: Connector,
   defectHandler: DefectHandler,
   sendWindowTimeoutMs: Long = FlowController.DefaultSendWindowTimeoutMs,
-) {
-  private val routeTree: RouteTree[Route[Ctx]] =
-    H2Transport.buildRouteTree(routes)
+) extends QuiescentEngine {
+  // One shared application dispatcher for every stream on every connection
+  // (see EngineDispatcher): routing lives outside the wire stack, so the H1
+  // engine (Todo 7) and this transport define application behavior exactly
+  // once. Telemetry stays here (see instrumentRequest).
+  private val dispatcher = new EngineDispatcher(routes, context, defectHandler)
+
+  // Live connections owned by this transport: the engine drain/close hooks
+  // (see drainAll/closeAll) iterate this set. Entries are added on accept
+  // and removed when the connection handler returns.
+  private val connections = ConcurrentHashMap.newKeySet[H2Connection]()
+
+  /**
+   * Live-connection accounting for the aggregate drain (Todo 8): entered on
+   * accept, exited when the connection handler returns, so an empty tracker
+   * means no connection — drained or not — is still running.
+   */
+  private val inFlight = new InFlightTracker()
+
+  /**
+   * Block up to `timeout` for in-flight connections to settle (Todo 8).
+   */
+  def awaitQuiescent(timeout: Duration): Boolean = inFlight.awaitEmpty(timeout)
 
   private val requestCounter        = metric.counter("http.requests.total")
   private val activeConnections     = metric.upDownCounter("http.connections.active")
@@ -83,6 +103,7 @@ final class H2Transport[Ctx](
             val peer   = PeerInfo(conn.peer.address, conn.peer.peerCert)
             activeConnectionCount.incrementAndGet()
             activeConnections.add(1L, "protocol" -> protocolName)
+            inFlight.enter()
             try {
               val flowController =
                 new FlowController(H2Settings.DefaultInitialWindowSize.toInt, http2Config.initialWindowSize)
@@ -104,7 +125,12 @@ final class H2Transport[Ctx](
                   requestTimeoutMs = connector.requestTimeoutMs,
                   headerTimeoutMs = connector.headerTimeoutMs,
                 )
-              connection.run(stream => handleStream(stream, flowController, hpackCodec, connection, peer, peerTrusted))
+              connections.add(connection)
+              try
+                connection.run(stream =>
+                  handleStream(stream, flowController, hpackCodec, connection, peer, peerTrusted),
+                )
+              finally connections.remove(connection)
             } catch {
               case e: Throwable =>
                 logger.error(
@@ -115,6 +141,7 @@ final class H2Transport[Ctx](
                   "stacktrace"    -> AttributeValue.StringValue(stackTraceToString(e)),
                 )
             } finally {
+              inFlight.exit()
               activeConnectionCount.decrementAndGet()
               activeConnections.add(-1L, "protocol" -> protocolName)
             }
@@ -125,6 +152,7 @@ final class H2Transport[Ctx](
           BoundConnector(BoundAddress.Tcp(bound.host, bound.port), connector.protocol),
           bound.close,
           bound.isRunning,
+          bound.stopAccepting,
         )
       case BindAddress.Unix(path)      =>
         throw new UnsupportedOperationException("Unix domain sockets are not implemented yet: " + path)
@@ -136,6 +164,28 @@ final class H2Transport[Ctx](
       case Protocol.H2(tls, _)  => Some(tls)
       case Protocol.H3(_, _, _) => None
     }
+
+  /**
+   * Graceful drain of every owned connection, mapped from
+   * [[zio.http.ProtocolEngine.drain]] via [[H2Engine]]: each connection emits
+   * GOAWAY(NO_ERROR) and wakes its blocked flow/frame waiters while in-flight
+   * streams run to completion. Best-effort per connection.
+   */
+  def drainAll(): Unit = {
+    val iterator = connections.iterator()
+    while (iterator.hasNext) iterator.next().drain()
+  }
+
+  /**
+   * Force-close of every owned connection, mapped from
+   * [[zio.http.ProtocolEngine.close]] via [[H2Engine]]: parked flow and frame
+   * waiters fail fast instead of parking to their deadlines. Best-effort per
+   * connection.
+   */
+  def closeAll(): Unit = {
+    val iterator = connections.iterator()
+    while (iterator.hasNext) iterator.next().closeNow()
+  }
 
   private def handleStream(
     stream: MuxStream[Int, H2Frame, H2Frame],
@@ -228,7 +278,7 @@ final class H2Transport[Ctx](
       span.setAttribute("url.path", requestPath)
       span.setAttribute("network.protocol.name", protocolName)
 
-      val response   = handleRequest(request)
+      val response   = dispatcher.dispatch(request)
       val durationMs = nanosToMillis(System.nanoTime() - startedAtNanos)
 
       span.setAttribute("http.response.status_code", response.status.code.toLong)
@@ -351,33 +401,6 @@ final class H2Transport[Ctx](
       case None       => withScheme
     }
   }
-
-  private def handleRequest(request: Request): Response = {
-    routeTree.get(request.method, request.path) match {
-      case Some(route) =>
-        route.pattern.decode(request.method, request.path) match {
-          case Right(vars) =>
-            val openScope = Scope.global.open()
-            try {
-              toResponse(invokeHandler(route, request, vars, openScope.scope), request)
-            } finally {
-              openScope.close().orThrow()
-            }
-          case Left(_)     => Response.notFound
-        }
-      case None        => Response.notFound
-    }
-  }
-
-  private def invokeHandler(route: Route[Ctx], request: Request, vars: Any, scope: Scope): Any =
-    try route.handler.handle(request, context, vars, scope)
-    catch {
-      case throwable: Throwable =>
-        try defectHandler.handleDefect(request, throwable)
-        catch {
-          case _: Throwable => Response.internalServerError
-        }
-    }
 
   private def sendResponse(
     stream: MuxStream[Int, H2Frame, H2Frame],
@@ -601,7 +624,7 @@ final class H2Transport[Ctx](
           throw new H2Transport.Aborted
         }
         flowController.consumeSendWindow(stream.id, chunk.length, sendWindowTimeoutMs)
-        sendFrame(stream, Data(stream.id, chunk, endStream = endStream))
+        sendFrame(stream, Data(stream.id, chunk, endStream = endStream), connection)
         if (stream.isClosed) {
           abort()
           throw new H2Transport.Aborted
@@ -627,6 +650,9 @@ final class H2Transport[Ctx](
         catch {
           case NonFatal(_) => ()
         }
+        // The reset cancels the mux entry: wake the writer (it reaps the
+        // entry) and any frame waiter parked on the dead stream.
+        connection.signalStateChange()
       }
   }
 
@@ -834,14 +860,23 @@ final class H2Transport[Ctx](
         if (!stream.isClosed) resetStream(stream, connection, H2Error.Code.CANCEL)
         throw H2Transport.StreamTimeout(stream.id, deadlineNanos)
       }
-      toReceivedFrame(stream.receive()) match {
+      toReceivedFrame(connection.receiveOrPark(stream, waitNanos(deadlineNanos))) match {
         case Left(error) => throw new IllegalStateException("HTTP/2 stream receive failed: " + error)
         case Right(next) => frame = next
-        case null        => park()
       }
     }
     frame
   }
+
+  /**
+   * Bound for one frame-wait park (see [[H2Connection.receiveOrPark]]): a
+   * delivery racing the park either shows up in the poll or wakes the park, so
+   * this only bounds a missed-signal race — never a sleep-poll quantum. The
+   * loop re-checks the body deadline above on every wake.
+   */
+  private def waitNanos(deadlineNanos: Long): Long =
+    if (deadlineNanos == Long.MaxValue) H2Connection.FrameParkNanos
+    else Math.min(Math.max(0L, deadlineNanos - System.nanoTime()), H2Connection.FrameParkNanos)
 
   /**
    * Body-completion deadline as absolute nanos, measured from stream start.
@@ -851,8 +886,17 @@ final class H2Transport[Ctx](
     if (connector.bodyTimeoutMs <= 0L) Long.MaxValue
     else streamStartNanos + connector.bodyTimeoutMs * 1000000L
 
-  private def sendFrame(stream: MuxStream[Int, H2Frame, H2Frame], frame: H2Frame): Unit = {
+  private def sendFrame(
+    stream: MuxStream[Int, H2Frame, H2Frame],
+    frame: H2Frame,
+    connection: H2Connection,
+  ): Unit = {
     val result = stream.send(frame)
+    // The enqueue above may satisfy the writer loop or a racing close: wake
+    // it under the signal lock (see H2Connection.signalStateChange) so the
+    // writer observes the frame without waiting out its park bound — also on
+    // the failure path below, where the writer reaps the dead entry.
+    connection.signalStateChange()
     toSendError(result).foreach { error =>
       throw new IllegalStateException("HTTP/2 stream send failed: " + error)
     }
@@ -987,23 +1031,6 @@ final class H2Transport[Ctx](
     builder.result()
   }
 
-  private def toResponse(result: Any, request: Request): Response =
-    result match {
-      case response: Response       => response
-      case halt: Halt               => halt.response
-      case Left(response: Response) => response
-      case Right(halt: Halt)        => halt.response
-      case other                    =>
-        try {
-          toResponse(
-            defectHandler.handleDefect(request, new IllegalStateException("Unexpected handler result: " + other)),
-            request,
-          )
-        } catch {
-          case _: Throwable => Response.internalServerError
-        }
-    }
-
   private def chunkBody(body: Chunk[Byte], maxFrameSize: Int): Chunk[Chunk[Byte]] = {
     val frameSize = Math.max(1, maxFrameSize)
     val builder   = Chunk.newBuilder[Chunk[Byte]]
@@ -1016,12 +1043,6 @@ final class H2Transport[Ctx](
     }
     builder.result()
   }
-
-  private def park(): Unit =
-    try Thread.sleep(1L)
-    catch {
-      case _: InterruptedException => Thread.currentThread().interrupt()
-    }
 
   private def protocolName: String =
     connector.protocol match {
@@ -1099,18 +1120,6 @@ object H2Transport {
    */
   private final class Aborted extends RuntimeException("HTTP/2 response stream aborted") {
     override def fillInStackTrace(): Throwable = this
-  }
-
-  private def buildRouteTree[Ctx](routes: Routes[Ctx]): RouteTree[Route[Ctx]] =
-    routes.routes.foldLeft(RouteTree.empty[Route[Ctx]]) { (tree, route) =>
-      val alternatives = route.pattern.alternatives
-      if (alternatives.nonEmpty) tree.add(route.pattern, route)
-      else tree.merge(rootRouteTree(route))
-    }
-
-  private def rootRouteTree[Ctx](route: Route[Ctx]): RouteTree[Route[Ctx]] = {
-    val rootSubtree = SegmentSubtree[Route[Ctx]](Map.empty, ListMap.empty, Some(route))
-    RouteTree(Map(route.pattern.method -> rootSubtree))
   }
 
   private final case class PseudoHeaders(
