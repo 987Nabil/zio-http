@@ -82,35 +82,9 @@ case class Connector(
    * shared-connector policies the listener/engine work executes.
    */
   negotiation: NegotiationPolicy = NegotiationPolicy.Single,
-  /**
-   * Cleartext preface-sniff deadline in milliseconds, measured from accept
-   * until the 24-byte H2-preface decision completes.
-   *
-   * Bounds only the shared-cleartext (`CleartextPreface`) sniff: a peer that
-   * drips a preface prefix without ever completing it is closed on expiry
-   * instead of holding a half-preface connection open. Non-positive disables
-   * (consistent with the other connector timeouts). Default 5 seconds (see
-   * `Connector.DefaultPrefaceTimeoutMs`, kept in sync by
-   * `CleartextPrefaceDispatchSpec`).
-   *
-   * The default is a literal on purpose: companion members initialize in source
-   * order, so a default argument referencing a later companion `val` would read
-   * back zero while `Connector.default` initializes.
-   */
-  prefaceTimeoutMs: Long = 5000L,
-  /**
-   * Cap on connections concurrently parked inside the cleartext preface sniff.
-   * A connection past the cap is closed before reading a single byte, so
-   * half-open preface floods cannot exhaust virtual threads. Must be positive.
-   * Default 100 (see `Connector.DefaultMaxHalfPrefaceConnections`; literal for
-   * the same initialization-order reason as above).
-   */
-  maxHalfPrefaceConnections: Int = 100,
 ) {
   if (maxRequestBodySize < 0L)
     throw new IllegalArgumentException("maxRequestBodySize must be non-negative")
-  if (maxHalfPrefaceConnections <= 0)
-    throw new IllegalArgumentException("maxHalfPrefaceConnections must be positive")
 
   /**
    * The validated protocol set for this connector, migrated from the legacy
@@ -145,30 +119,6 @@ case class Connector(
 object Connector {
   val default: Connector = Connector()
 
-  /**
-   * Static bind-conflict check for two connectors: true when both request the
-   * same OS binding, so serving both would collide.
-   *
-   * Two TCP bindings conflict only on the same host and numeric port; two UDP
-   * bindings likewise; TCP and UDP never conflict because their numeric-port
-   * namespaces are independent (see [[TransportKind.sharesPortNamespace]]) — a
-   * future UDP engine may share a numeric port with a TCP connector. Two Unix
-   * bindings conflict on the same path. Ephemeral ports (`0`) never conflict:
-   * the OS assigns distinct ports at bind time.
-   */
-  def bindConflicts(first: Connector, second: Connector): Boolean =
-    (first.bind, second.bind) match {
-      case (BindAddress.Tcp(firstHost, firstPort), BindAddress.Tcp(secondHost, secondPort)) =>
-        firstPort != 0 && secondPort != 0 &&
-        (firstHost == secondHost) && (firstPort == secondPort) &&
-        TransportKind.sharesPortNamespace(first.transport, second.transport)
-      case (BindAddress.Unix(firstPath), BindAddress.Unix(secondPath))                      =>
-        firstPath == secondPath
-      case _                                                                                => false
-    }
-
-  implicit val schema: Schema[Connector] = Schema.derived[Connector]
-
   /** Default request-body cap: 1 MiB per stream. */
   val DefaultMaxRequestBodySize: Long = 1024L * 1024L
 
@@ -181,17 +131,7 @@ object Connector {
   /** Default body-completion (time-to-complete) deadline: 10 seconds. */
   val DefaultBodyTimeoutMs: Long = 10000L
 
-  /**
-   * Default cleartext preface-sniff deadline: 5 seconds (mirrors the
-   * `Connector` default literal).
-   */
-  val DefaultPrefaceTimeoutMs: Long = 5000L
-
-  /**
-   * Default cap on connections concurrently parked in the preface sniff
-   * (mirrors the `Connector` default literal).
-   */
-  val DefaultMaxHalfPrefaceConnections: Int = 100
+  implicit val schema: Schema[Connector] = Schema.derived[Connector]
 }
 
 sealed trait BindAddress
