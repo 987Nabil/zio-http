@@ -27,7 +27,13 @@ import zio.http.h1.H1RawClientFixture._
  * reports a must-close `H1Error`, the engine answers `400` (`413` for oversize
  * bodies) with `Connection: close` and closes, the handler never runs, a
  * smuggled victim request on the same bytes is never served, and a fresh
- * connection stays healthy afterwards.
+ * connection stays healthy afterwards. Every codec rejection additionally
+ * asserts decoder poisoning directly (`poisoned`, cleared buffer, and a
+ * `DecoderPoisoned` follow-up), not just the `mustClose` flag; one smuggling
+ * vector is also fed byte-at-a-time to prove fragmented delivery still rejects.
+ * Wire encoding is ISO-8859-1 on both layers (codec feed and socket bytes):
+ * high bytes are legal obs-text in values (`H1Validation.isHeaderValue`) but
+ * illegal in names (`isTokenChar`), pinned by a high-byte name vector.
  *
  * No pipelining, proxy, Upgrade, H3, or implementation changes: tests only.
  */
@@ -39,11 +45,22 @@ object H1RequestSmugglingSpec extends ZIOSpecDefault {
 
   private def codecRejectsAs[E <: H1Error](raw: String)(implicit
     tag: scala.reflect.ClassTag[E],
-  ): Boolean =
-    new H1Decoder().feed(wire(raw)) match {
-      case Left(error) => tag.runtimeClass.isInstance(error) && error.mustClose
+  ): Boolean = {
+    val decoder = new H1Decoder()
+    decoder.feed(wire(raw)) match {
+      case Left(error) =>
+        val poisonedReuse = decoder.feed(wire("GET / HTTP/1.1\r\nHost: x\r\n\r\n")) match {
+          case Left(_: H1Error.DecoderPoisoned) => true
+          case _                                => false
+        }
+        tag.runtimeClass.isInstance(error) &&
+        error.mustClose &&
+        decoder.poisoned &&
+        decoder.bufferedBytes == 0 &&
+        poisonedReuse
       case Right(_)    => false
     }
+  }
 
   private def countingRoutes(counter: AtomicInteger): Routes[Any] =
     Routes(
@@ -76,7 +93,9 @@ object H1RequestSmugglingSpec extends ZIOSpecDefault {
       ZIO.attemptBlocking {
         val client = new RawH1Client(port)
         try {
-          client.sendRaw(raw)
+          // ISO-8859-1, aligned with the codec feed: high bytes reach the
+          // parser unmangled (US_ASCII would silently replace them).
+          client.sendRaw(raw.getBytes("ISO-8859-1"))
           val resp                  = client.readResponse()
           // Unread smuggled bytes may turn the close into a reset instead of
           // a clean FIN; both prove the connection died with the request.
@@ -146,6 +165,34 @@ object H1RequestSmugglingSpec extends ZIOSpecDefault {
             ),
           )
         },
+        test("duplicated Transfer-Encoding classifies AmbiguousFraming and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.AmbiguousFraming](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+            ),
+          )
+        },
+        test("unsupported gzip coding classifies AmbiguousFraming and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.AmbiguousFraming](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
+            ),
+          )
+        },
+        test("transfer coding list classifies AmbiguousFraming and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.AmbiguousFraming](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+            ),
+          )
+        },
+        test("empty Transfer-Encoding classifies AmbiguousFraming and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.AmbiguousFraming](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:\r\n\r\n",
+            ),
+          )
+        },
         test("whitespace before the header colon classifies InvalidMessage must-close") {
           assertTrue(
             codecRejectsAs[H1Error.InvalidMessage](
@@ -171,6 +218,20 @@ object H1RequestSmugglingSpec extends ZIOSpecDefault {
           assertTrue(
             codecRejectsAs[H1Error.InvalidMessage](
               "GET /vic tim HTTP/1.1\r\nHost: x\r\n\r\n",
+            ),
+          )
+        },
+        test("bare LF line endings classify InvalidMessage and poison") {
+          assertTrue(
+            codecRejectsAs[H1Error.InvalidMessage](
+              "GET /echo HTTP/1.1\nHost: x\n\n",
+            ),
+          )
+        },
+        test("high byte in a header name classifies InvalidMessage and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.InvalidMessage](
+              "POST /echo HTTP/1.1\r\nHoÿst: x\r\nContent-Length: 0\r\n\r\n",
             ),
           )
         },
@@ -226,6 +287,66 @@ object H1RequestSmugglingSpec extends ZIOSpecDefault {
             ),
           )
         },
+        test("Content-Length with inner whitespace classifies InvalidMessage and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.InvalidMessage](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1 0\r\n\r\n",
+            ),
+          )
+        },
+        test("non-numeric Content-Length classifies InvalidMessage and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.InvalidMessage](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 12a\r\n\r\n",
+            ),
+          )
+        },
+        test("negative Content-Length classifies InvalidMessage and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.InvalidMessage](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n",
+            ),
+          )
+        },
+        test("chunk extensions classify InvalidMessage and poison") {
+          assertTrue(
+            codecRejectsAs[H1Error.InvalidMessage](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=x\r\nhello\r\n0\r\n\r\n",
+            ),
+          )
+        },
+        test("empty chunk-size line classifies InvalidMessage and poisons") {
+          assertTrue(
+            codecRejectsAs[H1Error.InvalidMessage](
+              "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\r\n",
+            ),
+          )
+        },
+        test("byte-at-a-time CL.TE feed still rejects AmbiguousFraming and poisons") {
+          val decoder                                   = new H1Decoder()
+          val bytes                                     = wire(
+            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n",
+          ).toArray
+          var outcome: Either[H1Error, List[H1Request]] = Right(Nil)
+          var i                                         = 0
+          while (i < bytes.length && outcome.isRight) {
+            outcome = decoder.feed(Chunk.fromArray(bytes.slice(i, i + 1)))
+            i += 1
+          }
+          val poisonedReuse = decoder.feed(wire("GET / HTTP/1.1\r\nHost: x\r\n\r\n")) match {
+            case Left(_: H1Error.DecoderPoisoned) => true
+            case _                                => false
+          }
+          assertTrue(
+            outcome match {
+              case Left(_: H1Error.AmbiguousFraming) => true
+              case _                                 => false
+            },
+            decoder.poisoned,
+            decoder.bufferedBytes == 0,
+            poisonedReuse,
+          )
+        },
         test("incomplete body blocks without error and completes exactly once") {
           val decoder = new H1Decoder()
           val partial = decoder.feed(wire("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nAB"))
@@ -265,6 +386,30 @@ object H1RequestSmugglingSpec extends ZIOSpecDefault {
             400,
           )
         },
+        test("duplicated Transfer-Encoding rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
+        test("unsupported gzip coding rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: gzip\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
+        test("transfer coding list rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
+        test("empty Transfer-Encoding rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding:\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
         test("whitespace before the header colon rejects 400 with no dispatch") {
           rejectsLive(
             "POST /echo HTTP/1.1\r\nHost : 127.0.0.1\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
@@ -286,6 +431,18 @@ object H1RequestSmugglingSpec extends ZIOSpecDefault {
         test("whitespace in the request target rejects 400 with no dispatch") {
           rejectsLive(
             "GET /vic tim HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
+        test("bare LF line endings reject 400 with no dispatch") {
+          rejectsLive(
+            "GET /echo HTTP/1.1\nHost: 127.0.0.1\n\n",
+            400,
+          )
+        },
+        test("high byte in a header name rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHoÿst: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
             400,
           )
         },
@@ -333,6 +490,36 @@ object H1RequestSmugglingSpec extends ZIOSpecDefault {
           rejectsLive(
             "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2000000\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             413,
+          )
+        },
+        test("Content-Length with inner whitespace rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1 0\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
+        test("non-numeric Content-Length rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 12a\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
+        test("negative Content-Length rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: -5\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
+        test("chunk extensions reject 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=x\r\nhello\r\n0\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
+          )
+        },
+        test("empty chunk-size line rejects 400 with no dispatch") {
+          rejectsLive(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            400,
           )
         },
         test("incomplete body dispatches nothing and closes with no response") {
