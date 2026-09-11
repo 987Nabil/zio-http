@@ -41,13 +41,18 @@ final class FlowController(initialConnectionWindow: Int, initialStreamWindow: In
   FlowController.requireValidInitialWindow(initialConnectionWindow, "connection")
   FlowController.requireValidInitialWindow(initialStreamWindow, "stream")
 
-  private val lock                  = new ReentrantLock(true)
-  private val connectionUpdated     = lock.newCondition()
-  private val connectionWindowValue = new AtomicInteger(initialConnectionWindow)
-  private val streamStates          = new ConcurrentHashMap[Int, FlowController.StreamState]()
+  private val lock                         = new ReentrantLock(true)
+  private val connectionUpdated            = lock.newCondition()
+  private val connectionWindowValue        = new AtomicInteger(initialConnectionWindow)
+  private val streamStates                 = new ConcurrentHashMap[Int, FlowController.StreamState]()
+  // Peer's SETTINGS_INITIAL_WINDOW_SIZE as last applied to the send path
+  // (RFC 9113 section 6.9.2): starts at the construction value — the RFC
+  // default 65535 until the peer's SETTINGS arrives — and is refreshed by
+  // [[updatePeerInitialStreamWindow]]. Always read/written under [[lock]].
+  private var peerInitialStreamWindow: Int = initialStreamWindow
   // Set once the owning connection is torn down: parked and future senders
   // fail fast instead of parking to their deadline (see invalidate).
-  private val invalidated           = new AtomicBoolean(false)
+  private val invalidated                  = new AtomicBoolean(false)
 
   def connectionWindow: Int = connectionWindowValue.get()
 
@@ -120,9 +125,42 @@ final class FlowController(initialConnectionWindow: Int, initialStreamWindow: In
     lock.lock()
     try {
       val previous =
-        streamStates.put(streamId, new FlowController.StreamState(initialStreamWindow, lock.newCondition()))
+        streamStates.put(streamId, new FlowController.StreamState(peerInitialStreamWindow, lock.newCondition()))
       if (previous.ne(null)) previous.updated.signalAll()
       connectionUpdated.signalAll()
+    } finally lock.unlock()
+  }
+
+  /**
+   * Apply the peer's SETTINGS_INITIAL_WINDOW_SIZE to the send path (RFC 9113
+   * section 6.9.2): later streams start at `newValue`, and every live send
+   * window moves by the delta between `newValue` and the previously applied
+   * value. Windows may go negative — senders park until WINDOW_UPDATEs recover
+   * them — exactly as the RFC requires. Idempotent for repeats.
+   *
+   * Without this, a peer advertising a larger window (the JDK client uses 16MB)
+   * would still stall past 64KB: it never tops up a window it never exhausts,
+   * while the server parks to [[DefaultSendWindowTimeoutMs]] and resets with
+   * CANCEL.
+   */
+  def updatePeerInitialStreamWindow(newValue: Int): Unit = {
+    FlowController.requireValidInitialWindow(newValue, "peer stream")
+    lock.lock()
+    try {
+      val delta = newValue.toLong - peerInitialStreamWindow.toLong
+      if (delta != 0L) {
+        peerInitialStreamWindow = newValue
+        val iterator = streamStates.values().iterator()
+        while (iterator.hasNext) {
+          val state = iterator.next()
+          val next  = state.window.get().toLong + delta
+          if (next > FlowController.MaxWindowSize.toLong)
+            throw new FlowController.FlowControlException("HTTP/2 stream flow-control window exceeded 2^31-1")
+          state.window.set(next.toInt)
+          state.updated.signalAll()
+        }
+        connectionUpdated.signalAll()
+      }
     } finally lock.unlock()
   }
 

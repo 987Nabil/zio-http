@@ -253,6 +253,7 @@ final class H2Connection(
       readFrame() match {
         case Settings(false, settings) =>
           peerSettings = settings
+          applyPeerInitialWindow(settings)
           writeFrame(Settings(ack = true, Nil), flush = true)
         case other => throw protocolError("Expected client SETTINGS after preface, received: " + other)
       }
@@ -330,6 +331,7 @@ final class H2Connection(
     frame match {
       case Settings(false, settings)  =>
         peerSettings = settings
+        applyPeerInitialWindow(settings)
         writeFrame(Settings(ack = true, Nil), flush = true)
       case Settings(true, _)          => settingsAcknowledged = true
       case Ping(false, data)          => writeFrame(Ping(ack = true, data), flush = true)
@@ -346,6 +348,20 @@ final class H2Connection(
       case _                          =>
         throw protocolError("Unexpected connection-level frame: " + frame)
     }
+
+  /**
+   * RFC 9113 section 6.9.2: the peer's SETTINGS_INITIAL_WINDOW_SIZE governs
+   * this connection's per-stream send windows. Absent means the RFC default
+   * 65535; a change moves every live send window by the delta (see
+   * [[FlowController.updatePeerInitialStreamWindow]]).
+   */
+  private def applyPeerInitialWindow(settings: List[Setting]): Unit = {
+    val initial = settings
+      .find(_.id == Setting.INITIAL_WINDOW_SIZE)
+      .map(_.value.toInt)
+      .getOrElse(H2Settings.DefaultInitialWindowSize.toInt)
+    flowController.updatePeerInitialStreamWindow(initial)
+  }
 
   private def deliverRequestHeaders(headers: Headers, onStream: MuxStream[Int, H2Frame, H2Frame] => Unit): Unit = {
     // Always decode (advances the shared decoder's table in wire order), but store only the
