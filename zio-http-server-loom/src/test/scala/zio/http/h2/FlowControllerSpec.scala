@@ -77,6 +77,38 @@ object FlowControllerSpec extends ZIOSpecDefault {
           fc.streamWindow(1) == 65535,
         )
       },
+      test("updatePeerInitialStreamWindow raises live windows and later registrations") {
+        val fc = makeFlowController()
+        fc.consumeSendWindow(1, 100)
+        fc.updatePeerInitialStreamWindow(16777216)
+        fc.registerStream(3)
+
+        assertTrue(
+          fc.streamWindow(1) == 16777116,
+          fc.streamWindow(3) == 16777216,
+          fc.connectionWindow == 65435,
+        )
+      },
+      test("updatePeerInitialStreamWindow decrease moves live windows down") {
+        val fc = makeFlowController()
+        fc.updatePeerInitialStreamWindow(100)
+        fc.applyWindowUpdate(1, 60)
+
+        assertTrue(
+          fc.streamWindow(1) == 160,
+          fc.connectionWindow == 65535,
+        )
+      },
+      test("updatePeerInitialStreamWindow repeat with the same value is a no-op") {
+        val fc = makeFlowController()
+        fc.consumeSendWindow(1, 100)
+        fc.updatePeerInitialStreamWindow(65535)
+
+        assertTrue(
+          fc.streamWindow(1) == 65435,
+          fc.connectionWindow == 65435,
+        )
+      },
     )
 
   private def makeFlowController(): FlowController = {

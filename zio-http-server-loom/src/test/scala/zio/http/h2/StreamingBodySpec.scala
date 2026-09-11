@@ -216,6 +216,12 @@ object StreamingBodySpec extends ZIOSpecDefault {
           ZIO.attemptBlocking {
             val client = new RawH2Client(port)
             try {
+              // RFC 9113 S6.9.2 (Todo 16 fix): the peer's
+              // SETTINGS_INITIAL_WINDOW_SIZE governs the server's send
+              // windows — advertise 100 so the 2000-byte body stalls.
+              client.sendFrame(
+                Settings(ack = false, List(zio.http.h2.Setting(zio.http.h2.Setting.INITIAL_WINDOW_SIZE, 100L))),
+              )
               client.sendFrame(client.makeHeaders("GET", "/", streamId = 1, endStream = true))
 
               var sawHeaders = false

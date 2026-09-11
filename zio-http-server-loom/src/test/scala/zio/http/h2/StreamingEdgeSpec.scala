@@ -431,6 +431,12 @@ object StreamingEdgeSpec extends ZIOSpecDefault {
             val client    = new RawH2Client(port, autoWindowUpdate = false)
             val startedAt = java.lang.System.currentTimeMillis()
             try {
+              // RFC 9113 S6.9.2 (Todo 16 fix): the peer's
+              // SETTINGS_INITIAL_WINDOW_SIZE governs the server's send
+              // windows — advertise 0 so the stream starts fully stalled.
+              client.sendFrame(
+                Settings(ack = false, List(zio.http.h2.Setting(zio.http.h2.Setting.INITIAL_WINDOW_SIZE, 0L))),
+              )
               client.sendFrame(client.makeHeaders("GET", "/", streamId = 1, endStream = true))
               var sawHeaders     = false
               var dataFrames     = 0
@@ -488,6 +494,12 @@ object StreamingEdgeSpec extends ZIOSpecDefault {
           ZIO.attemptBlocking {
             val client = new RawH2Client(port, autoWindowUpdate = false)
             try {
+              // RFC 9113 S6.9.2 (Todo 16 fix): the peer's
+              // SETTINGS_INITIAL_WINDOW_SIZE governs the server's send
+              // windows — advertise 0 so the writer genuinely parks.
+              client.sendFrame(
+                Settings(ack = false, List(zio.http.h2.Setting(zio.http.h2.Setting.INITIAL_WINDOW_SIZE, 0L))),
+              )
               client.sendFrame(client.makeHeaders("GET", "/", streamId = 1, endStream = true))
               var sawHeaders = false
               client.socket.setSoTimeout(20000)
