@@ -17,7 +17,7 @@
 package zio.http.h2
 
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 import java.util.concurrent.TimeUnit
 
@@ -45,6 +45,9 @@ final class FlowController(initialConnectionWindow: Int, initialStreamWindow: In
   private val connectionUpdated     = lock.newCondition()
   private val connectionWindowValue = new AtomicInteger(initialConnectionWindow)
   private val streamStates          = new ConcurrentHashMap[Int, FlowController.StreamState]()
+  // Set once the owning connection is torn down: parked and future senders
+  // fail fast instead of parking to their deadline (see invalidate).
+  private val invalidated           = new AtomicBoolean(false)
 
   def connectionWindow: Int = connectionWindowValue.get()
 
@@ -71,6 +74,8 @@ final class FlowController(initialConnectionWindow: Int, initialStreamWindow: In
     lock.lock()
     try {
       val state    = requireStreamState(streamId)
+      if (invalidated.get())
+        throw new IllegalStateException("HTTP/2 connection closed while waiting for flow-control window")
       val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs.max(0L))
       while (connectionWindowValue.get() < bytes || state.window.get() < bytes) {
         val remaining = deadline - System.nanoTime()
@@ -79,6 +84,8 @@ final class FlowController(initialConnectionWindow: Int, initialStreamWindow: In
         // the other level cannot wake us spuriously; the loop re-checks both.
         if (connectionWindowValue.get() < bytes) connectionUpdated.awaitNanos(remaining)
         else state.updated.awaitNanos(remaining)
+        if (invalidated.get())
+          throw new IllegalStateException("HTTP/2 connection closed while waiting for flow-control window")
         ensureStreamRegistered(streamId, state)
       }
       connectionWindowValue.addAndGet(-bytes)
@@ -126,6 +133,34 @@ final class FlowController(initialConnectionWindow: Int, initialStreamWindow: In
       if (state.ne(null)) state.updated.signalAll()
       connectionUpdated.signalAll()
     } finally lock.unlock()
+  }
+
+  /**
+   * Wake every parked sender without changing any window (drain signal): the
+   * waiter re-checks its predicates and re-parks when the window is still
+   * short, so in-flight work is never aborted — it just observes the drain
+   * promptly instead of sleeping to its deadline. See [[invalidate]] for the
+   * force-release twin used on connection teardown.
+   */
+  def wakeAll(): Unit = {
+    lock.lock()
+    try {
+      connectionUpdated.signalAll()
+      signalAllStreams()
+    } finally lock.unlock()
+  }
+
+  /**
+   * Tear the connection down for flow-control purposes: every thread parked in
+   * [[consumeSendWindow]] is woken and fails fast with `IllegalStateException`,
+   * and future sends fail the same way, instead of parking to their deadline
+   * against a dead connection. Idempotent: the first call wins, later calls
+   * only re-signal. The owning [[H2Connection]] calls this from every shutdown
+   * path.
+   */
+  def invalidate(): Unit = {
+    invalidated.set(true)
+    wakeAll()
   }
 
   private def requireStreamState(streamId: Int): FlowController.StreamState = {
