@@ -39,6 +39,16 @@ class LoomServer(
         case Right(_)    => ()
       }
     val allConnectors = connector :: additionalConnectors
+    // Fail-before-bind: every connector is model-validated (H3, UDP, policy)
+    // before any socket is opened. InvalidConnector wraps the typed
+    // ConnectorFailure so callers never see raw UnsupportedOperationException
+    // from H2Engine/H2Transport construction.
+    allConnectors.foreach { c =>
+      c.validate match {
+        case Left(failure) => throw InvalidConnector(failure)
+        case Right(_)      => ()
+      }
+    }
     // Aggregate multi-engine startup (Todo 8): every connector binds through
     // its engine in order, and a bind failure rolls back the engines bound so
     // far in reverse order (see AggregateServerHandle.bindEngines) — nothing
