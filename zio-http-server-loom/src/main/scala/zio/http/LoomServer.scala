@@ -39,6 +39,17 @@ class LoomServer(
         case Right(_)    => ()
       }
     val allConnectors = connector :: additionalConnectors
+    // Todo 19 integration: restore the Todo-14 fail-fast contract on the
+    // composed stack — every connector validates BEFORE any socket binds, so
+    // production H3 (or transport-mismatched) configs fail typed
+    // (InvalidConnector) instead of escaping as raw engine-construction
+    // errors from the internally-created engine below.
+    allConnectors.foreach { c =>
+      c.validate match {
+        case Left(failure) => throw InvalidConnector(failure)
+        case Right(_)      => ()
+      }
+    }
     // Aggregate multi-engine startup (Todo 8): every connector binds through
     // its engine in order, and a bind failure rolls back the engines bound so
     // far in reverse order (see AggregateServerHandle.bindEngines) — nothing
