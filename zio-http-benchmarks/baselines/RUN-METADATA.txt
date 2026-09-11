@@ -1,0 +1,81 @@
+Todo 18 controlled-run provenance (durable record — the per-run console logs
+are git-ignored; THIS file plus the two JSONs and CHECKER_AB.txt is the
+checked-in evidence).
+
+HOST (both runs, same machine, back-to-back)
+  host: oss-agent
+  cpu: AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, 12 threads
+  ram: 47 GiB
+  loadavg start AB run: 2.20 2.71 1.74 (2026-09-11T01:50:43Z)
+  loadavg AB end / current start: 1.87 2.34 1.73 (2026-09-11T01:53:01Z)
+  loadavg current end: 2.27 2.22 1.89 (2026-09-11T01:59:17Z)
+  Shared container host; never quiet. Absolute time scores are valid only
+  under these conditions — never universalize them.
+
+JDK (identical binary both runs — pinned, not assumed)
+  jmh_jvm: /opt/jdk-25/bin/java
+  version: Temurin 25.0.4.1+1 (OpenJDK 64-Bit Server VM 25.0.4.1+1-LTS)
+  proof: both run logs contain
+    # VM invoker: /opt/jdk-25/bin/java
+    # VM version: JDK 25.0.4.1, OpenJDK 64-Bit Server VM, 25.0.4.1+1-LTS
+  history: Mill's default fork resolved a coursier-provisioned 25.0.2 on
+  earlier runs (caught via the same invoker line); all checked-in data was
+  re-measured with the explicit JMH `-jvm` pin. Mill 1.1.7 both trees.
+  GC: G1 (JDK 25 default), no explicit -XX flags; JMH logs
+  "# VM options: <none>".
+  PR CI uses the setup-action JDK (temurin:25, 25.0.4.1 family) pinned the
+  same way: `-jvm "$JAVA_HOME/bin/java"` in perf-baseline.yml. Same release
+  as the controlled runs; host-local install paths differ.
+
+POWER (unknown / uncontrollable — recorded, not tuned)
+  /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor: absent
+    (cat: No such file or directory)
+  cpupower frequency-info: "no or unknown cpufreq driver is active on this CPU"
+  The container exposes no power controls; no power claim is made.
+
+RUNS
+  baseline JSON: h2-692d3bdd-scala3.8.3-temurin25.json
+    tree: 692d3bdd59d55a30a587b6a633032112b465d114 (H2 P1 hardening)
+    scala: 3.8.3 (the baseline's pinned version — sole toolchain confound,
+    recorded not hidden)
+    command (from the AB workspace root):
+      ./mill 'benchmarks.jvm[3.8.3].runJmh' \
+        'ProtocolEngineBaselineBenchmark' \
+        -jvm /opt/jdk-25/bin/java -prof gc \
+        -rf json -rff /tmp/task18-ab-692d3bdd.json
+    duration: 136s, exit 0
+  current JSON: protocol-current-3.9.0-temurin25.json
+    tree: Todo18 stack (Todo9 tip 9f0a2b9b + this PR's harness)
+    scala: 3.9.0
+    command (from this workspace root):
+      ./mill 'benchmarks.jvm[3.9.0].runJmh' \
+        'ProtocolEngineBaselineBenchmark' \
+        -jvm /opt/jdk-25/bin/java -prof gc \
+        -rf json -rff /tmp/task18-current-3.9.0.json
+    duration: 376s, exit 0
+  shared JMH shape: forks=2, warmup=5x1s, measurement=10x1s (AverageTime) /
+  5x1s (SampleTime *P99), `-prof gc`, fixed corpus pinned in
+  ProtocolEngineBaselineBenchmark sources.
+
+BASELINE-SIDE REPRODUCTION (throwaway rig, never committed to history)
+  jj workspace add /home/user/worktrees/zio-http-task18-ab --revision 'xrroptxmvrrv'
+  # (= git 692d3bdd59d55a30a587b6a633032112b465d114)
+  then, inside that workspace only:
+  1. new file zio-http-benchmarks/src/main/scala-3/zio/http/benchmarks/ProtocolEngineBaselineBenchmark.scala
+     — H2 frame-codec mirror (h2EncodePing/h2DecodePing/h2EncodeSettings,
+     h2EncodePingP99/h2DecodePingP99) with package/class/method names,
+     JMH annotations, corpus, and profiler flags IDENTICAL to the H2 subset
+     of the current-stack benchmark, so the checker compares like-for-like.
+  2. build.mill benchmarks moduleDeps: Seq(core.jvm()) -> Seq(core.jvm(), h2Codec.jvm()).
+  Only the H2 frame path predates the protocol-engine work, so only it has a
+  baseline counterpart; H1/dispatch/concurrent shapes are new-in-stack
+  baselines with no 692d3bdd equivalent.
+
+STATUS (honest, no post-hoc pass)
+  A/B H2: warm +0.04..+3.98%, p99 -2.67..+3.88%, alloc +/-0.00% — PASS.
+  H1 budgets: parseGet 340.6/800ns 1720/2048B, parsePost 296.2/1000ns
+  1520/1792B — PASS (full checker output: CHECKER_AB.txt).
+  Shared dispatch overhead: +282% with disjoint 99.9% CIs — RED, stands.
+  The post-hoc condition note in ProtocolBaselineThresholds explains context
+  but asserts no override. Todo 18 remains PENDING an explicit F2
+  correctness-tradeoff decision.

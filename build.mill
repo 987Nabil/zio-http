@@ -500,7 +500,11 @@ object benchmarks extends Module {
   trait JvmModule extends ZioHttpModule with JmhModule {
     def artifactName     = "zio-http-benchmarks"
     def jmhCoreVersion   = "1.37"
-    def moduleDeps       = Seq(core.jvm())
+    // Todo 18: the protocol-engine baselines need the shared dispatcher
+    // (server), the strict H1 codec (h1Codec) and the H2 frame codec
+    // (h2Codec) in addition to the model types (core). No engine runtime
+    // (serverLoom) dependency: all workloads are in-process, no sockets.
+    def moduleDeps       = Seq(core.jvm(), server.jvm(), h2Codec.jvm(), h1Codec.jvm())
     override def mvnDeps = super[ZioHttpModule].mvnDeps() ++ super[JmhModule].mvnDeps()
     // NOTE: `r / "src" / "main" / "scala"` (the version-agnostic dir) intentionally excluded -
     // it holds pre-existing legacy pre-v4 zhttp/sbt-jmh benchmark sources (untouched by this

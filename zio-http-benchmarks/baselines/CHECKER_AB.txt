@@ -1,0 +1,34 @@
+CHECKER_AB: 2026-09-11T01:59:52Z
+baseline: zio-http-benchmarks/baselines/h2-692d3bdd-scala3.8.3-temurin25.json (692d3bdd, Scala 3.8.3, pinned /opt/jdk-25)
+current: zio-http-benchmarks/baselines/protocol-current-3.9.0-temurin25.json (task18 stack, Scala 3.9.0, pinned /opt/jdk-25)
+command: ./mill 'benchmarks.jvm[3.9.0].runMain' zio.http.benchmarks.BaselineRegressionCheck <baseline> <current>
+checker exit code: 1 (dispatch gate red — expected; output re-verified byte-identical on a later deterministic re-run)
+
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchDirectP99 has no baseline entry (new benchmark, no gate)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2DecodePingP99 rel=+3.98% (CI-separation required to fail)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2DecodePingP99 p99 rel=+0.00%
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2DecodePingP99 alloc rel=+0.00%
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchShared has no baseline entry (new benchmark, no gate)
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h1EncodeResponse has no baseline entry (new benchmark, no gate)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodePingP99 rel=+0.96% (CI-separation required to fail)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodePingP99 p99 rel=+0.00%
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodePingP99 alloc rel=-0.00%
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchSharedConcurrent has no baseline entry (new benchmark, no gate)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodePing rel=+0.04% (CI-separation required to fail)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodePing p99 rel=-2.67%
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodePing alloc rel=+0.00%
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2DecodePing rel=+1.65% (CI-separation required to fail)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2DecodePing p99 rel=+2.55%
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2DecodePing alloc rel=+0.00%
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchDirect has no baseline entry (new benchmark, no gate)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodeSettings rel=+2.62% (CI-separation required to fail)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodeSettings p99 rel=+3.88%
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodeSettings alloc rel=+0.00%
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h1ParsePostFixed has no baseline entry (new benchmark, no gate)
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchSharedP99 has no baseline entry (new benchmark, no gate)
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h1ParseGet has no baseline entry (new benchmark, no gate)
+ok: H1 budget .h1ParseGet alloc 1720.0 B/op <= 2048.0 B/op
+ok: H1 budget .h1ParseGet time 340.6 ns/op <= 800.0 ns/op
+ok: H1 budget .h1ParsePostFixed alloc 1520.0 B/op <= 1792.0 B/op
+ok: H1 budget .h1ParsePostFixed time 296.2 ns/op <= 1000.0 ns/op
+BaselineRegressionCheck FAIL: shared dispatch overhead 282.16% exceeds 5% with disjoint CIs

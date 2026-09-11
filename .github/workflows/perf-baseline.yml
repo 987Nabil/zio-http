@@ -1,0 +1,76 @@
+name: Perf baseline alloc gates
+
+# Todo 18: enforces the CROSS-HOST-SOUND baseline dimensions on PR CI via
+# BaselineRegressionCheck --ci-gate: codec alloc regression vs the checked-in
+# controlled JSON, absolute H1 alloc budgets, and harness-integrity coverage
+# (every checked-in benchmark must be present in the run).
+#
+# Deliberately NOT enforced here:
+# - time dimensions (warm scores, p99, dispatch overhead): shared runners
+#   cannot hold them to 5%; evaluated on controlled hosts, recorded in
+#   evidence. Never claim otherwise.
+# - dispatch-shape alloc: escape-analysis outcomes differ by microarchitecture
+#   (proven +10.45%/−12.50% on identical code/JDK/params across hosts), so
+#   dispatch alloc is time-gated with its overhead gate on controlled hosts.
+#
+# Interval note: JMH emits 99.9% CIs while the plan asks for 99%. Disjoint
+# 99.9% intervals imply disjoint 99% intervals, so the full-mode gates are
+# conservative; overlap is reported as noise, never as failure.
+
+on:
+  pull_request:
+    paths:
+      - 'zio-http-benchmarks/**'
+      - 'build.mill'
+      - '.github/workflows/perf-baseline.yml'
+
+concurrency:
+  group: perf-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alloc-gates:
+    name: Alloc gates — Scala 3.9.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup JDK
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:25
+      - name: Cache Coursier dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/coursier
+          key: ${{ runner.os }}-coursier-${{ hashFiles('build.mill') }}
+          restore-keys: |
+            ${{ runner.os }}-coursier-
+      - name: Runner metadata (host/JDK/GC, recorded not controlled)
+        run: |
+          cat /proc/cpuinfo | grep 'model name' | head -n 1
+          echo "nproc: $(nproc)"
+          free -g | head -n 2
+          cat /proc/loadavg
+          echo "JAVA_HOME=$JAVA_HOME"
+          "$JAVA_HOME/bin/java" -version 2>&1
+          java -version 2>&1
+          java -XX:+PrintFlagsFinal -version 2>&1 | grep -iE 'UseG1GC|UseParallelGC|UseZGC|MaxHeapSize' | head -n 5
+      # Pin JMH forks to the setup-action JDK: Mill otherwise resolves its own
+      # coursier JVM (observed 25.0.2 vs PATH 25.0.4.1), which would silently
+      # run the gates on an unrecorded JDK. The JMH log's "VM invoker" line
+      # proves the pin on every run.
+      - name: Short JMH with gc profiler (codec alloc is cross-host stable)
+        run: chmod +x ./mill && ./mill 'benchmarks.jvm[3.9.0].runJmh' 'ProtocolEngineBaselineBenchmark' -jvm "$JAVA_HOME/bin/java" -prof gc -f 1 -wi 2 -i 3 -rf json -rff /tmp/ci-perf.json
+      # runMainLocal (in-process) instead of runMain (forked): Mill 1.1.7's
+      # forked runMain intermittently reports "Subprocess failed" AFTER the
+      # checker already printed PASS (1/5 local iters, 2 consecutive GH runs;
+      # gate output itself proven byte-identical/deterministic). The checker is
+      # pure file comparison — JDK-agnostic — so in-process execution removes
+      # the fork-plumbing flake without changing what is enforced. Absolute
+      # paths because runMainLocal resolves them from a different CWD.
+      # Negative controls (dispatch FAIL, coverage FAIL) re-verified under
+      # runMainLocal: exit 1 with the same FAIL lines.
+      - name: Enforce alloc gates against the checked-in controlled baseline
+        run: chmod +x ./mill && ./mill 'benchmarks.jvm[3.9.0].runMainLocal' zio.http.benchmarks.BaselineRegressionCheck --ci-gate "$GITHUB_WORKSPACE/zio-http-benchmarks/baselines/protocol-current-3.9.0-temurin25.json" /tmp/ci-perf.json

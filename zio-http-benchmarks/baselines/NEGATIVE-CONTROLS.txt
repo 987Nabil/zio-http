@@ -1,0 +1,50 @@
+NEGATIVE CONTROLS — proof that each checker fail-path fires on real data.
+Neither control is performance evidence; both are harness self-tests with
+real JMH-measured inputs (no synthetic JSON).
+
+CONTROL 1 — dispatch-overhead gate fires (exit 1).
+  Full output: CHECKER_AB.txt (same directory). Decisive line:
+  BaselineRegressionCheck FAIL: shared dispatch overhead 282.16% exceeds 5% with disjoint CIs
+  Input: the checked-in A/B JSON pair (real back-to-back runs, pinned JVM).
+  The gate stands RED; see RUN-METADATA.txt status section.
+
+CONTROL 2 — harness-integrity coverage gate fires (exit 1).
+  Partial input: a real short JMH run (3 benchmark filters, -f 1 -wi 2 -i 3,
+  -prof gc, same host/JDK), 2026-09-11T07:47:22Z, 96692 bytes, 6 benchmarks
+  (dispatchDirect[P99], dispatchShared[P99,Concurrent], h1ParseGet).
+  Command:
+    ./mill 'benchmarks.jvm[3.9.0].runJmh' \
+      'ProtocolEngineBaselineBenchmark.dispatchDirect' \
+      'ProtocolEngineBaselineBenchmark.dispatchShared' \
+      'ProtocolEngineBaselineBenchmark.h1ParseGet' \
+      -prof gc -f 1 -wi 2 -i 3 -rf json -rff /tmp/ci-params-local.json
+  Checker command:
+    ./mill 'benchmarks.jvm[3.9.0].runMain' \
+      zio.http.benchmarks.BaselineRegressionCheck --ci-gate \
+      zio-http-benchmarks/baselines/protocol-current-3.9.0-temurin25.json \
+      /tmp/ci-params-local.json
+  checker exit code: 1. Complete checker stdout follows.
+
+mode: ci-gate
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchDirectP99 present in current run
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchShared present in current run
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchSharedConcurrent present in current run
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchDirect present in current run
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchSharedP99 present in current run
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h1ParseGet present in current run
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchDirectP99 dispatch shape excluded from cross-host alloc gate (time-gated on controlled hosts)
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchShared dispatch shape excluded from cross-host alloc gate (time-gated on controlled hosts)
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchSharedConcurrent dispatch shape excluded from cross-host alloc gate (time-gated on controlled hosts)
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchDirect dispatch shape excluded from cross-host alloc gate (time-gated on controlled hosts)
+note: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.dispatchSharedP99 dispatch shape excluded from cross-host alloc gate (time-gated on controlled hosts)
+ok: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h1ParseGet alloc rel=-0.00%
+ok: H1 budget .h1ParseGet alloc 1720.0 B/op <= 2048.0 B/op
+note: .h1ParsePostFixed absent (budget gate skipped)
+note: dispatch overhead gate skipped (time dimension, not evaluated in alloc-only/ci-gate modes)
+BaselineRegressionCheck FAIL: harness integrity: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2DecodePingP99 present in baseline but missing from current run
+BaselineRegressionCheck FAIL: harness integrity: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h1EncodeResponse present in baseline but missing from current run
+BaselineRegressionCheck FAIL: harness integrity: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodePingP99 present in baseline but missing from current run
+BaselineRegressionCheck FAIL: harness integrity: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodePing present in baseline but missing from current run
+BaselineRegressionCheck FAIL: harness integrity: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2DecodePing present in baseline but missing from current run
+BaselineRegressionCheck FAIL: harness integrity: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h2EncodeSettings present in baseline but missing from current run
+BaselineRegressionCheck FAIL: harness integrity: zio.http.benchmarks.ProtocolEngineBaselineBenchmark.h1ParsePostFixed present in baseline but missing from current run
